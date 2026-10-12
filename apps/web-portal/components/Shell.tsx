@@ -20,7 +20,8 @@ const isOperator = (u: SessionUser) => u.tenant.type === 'operator';
 const can = (u: SessionUser, ...roles: string[]) => roles.some((r) => u.roles.includes(r));
 
 const NAV: NavItem[] = [
-  { href: '/search', label: 'Search flights', show: (u) => can(u, 'agent') || isOperator(u) },
+  { href: '/search', label: 'Flights', show: (u) => can(u, 'agent') || isOperator(u) },
+  { href: '/hotels', label: 'Hotels', show: (u) => can(u, 'agent') || isOperator(u) },
   { href: '/bookings', label: 'Bookings', show: () => true },
   { href: '/wallet', label: 'Wallet', show: (u) => !isOperator(u) },
   { href: '/admin/agencies', label: 'Agencies', show: (u) => can(u, 'admin') && u.tenant.type !== 'branch' },

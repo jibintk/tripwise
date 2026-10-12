@@ -118,15 +118,24 @@ export interface Passenger {
 
 export interface Booking {
   reference: string;
+  product: 'flight' | 'hotel';
   status: string;
-  supplier: string;
+  supplier?: string;
   pnr: string | null;
   holdExpiresAt: string | null;
   ticketNumbers: string[];
   failureReason: string | null;
-  itinerary: Slice[];
+  /** flights */
+  itinerary?: Slice[];
   fareBrand?: string;
-  refundable: boolean;
+  refundable?: boolean;
+  /** hotels */
+  hotel?: { id: string; name: string; city: string; address: string; stars: number };
+  stay?: { checkIn: string; checkOut: string; nights: number; rooms: { adults: number; childAges?: number[] }[] };
+  room?: { name: string; board: string; refundable: boolean; freeCancellationUntil?: string };
+  hotelConfirmation?: string | null;
+  cancellation?: { penalty: Money; refunded: Money } | null;
+  specialRequests?: string;
   passengers: Passenger[];
   contact: { email: string; phone: string };
   pricing: Pricing;
@@ -194,6 +203,44 @@ export interface PricingRule {
   currency: string | null;
   priority: number;
 }
+
+export interface HotelResult {
+  id: string;
+  name: string;
+  city: string;
+  stars: number;
+  address: string;
+  amenities: string[];
+  suppliers: number;
+  rooms: number;
+  from: { agentCost: Money; sell: Money };
+  cheapestBoard: string;
+  freeCancellation: boolean;
+}
+
+export interface HotelSearchRequest {
+  city: string;
+  checkIn: string;
+  checkOut: string;
+  rooms: { adults: number; childAges?: number[] }[];
+}
+
+export interface RoomOffer {
+  rateId: string;
+  roomName: string;
+  board: string;
+  refundable: boolean;
+  freeCancellationUntil?: string;
+  pricing: Pricing;
+}
+
+export const BOARD_LABEL: Record<string, string> = {
+  RO: 'Room only',
+  BB: 'Breakfast included',
+  HB: 'Half board',
+  FB: 'Full board',
+  AI: 'All inclusive',
+};
 
 export function newIdempotencyKey(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto

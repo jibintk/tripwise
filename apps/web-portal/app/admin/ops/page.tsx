@@ -67,7 +67,7 @@ export default function OpsPage() {
                 <strong>
                   <Link href={`/bookings/${b.reference}`}>{b.reference}</Link>
                 </strong>{' '}
-                <span className={`status ${b.status}`}>{statusLabel(b.status)}</span>
+                <span className={`status ${b.status}`}>{statusLabel(b.status, b.product)}</span>
                 <div className="muted small">
                   {b.agencyPath.split('.').pop()} · PNR {b.pnr ?? '–'} · {b.failureReason ?? 'no ticket yet'} ·{' '}
                   {b.passengers[0].lastName}/{b.passengers[0].firstName} · {formatMoney(b.pricing.agentCost)}

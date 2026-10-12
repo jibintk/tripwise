@@ -1,15 +1,28 @@
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
-import { FlightOffer, money, Passenger, SupplierError, SupplierErrorCode } from '@tripwise/contracts';
+import {
+  FlightOffer,
+  HotelGuest,
+  HotelRate,
+  HotelSearchRequest,
+  money,
+  Passenger,
+  SupplierError,
+  SupplierErrorCode,
+} from '@tripwise/contracts';
+import { nightsBetween } from '@tripwise/supplier-gateway';
 import { randomBytes } from 'crypto';
 import { PoolClient } from 'pg';
 import { AuthUser, hasRole } from '../auth/auth.types';
 import { AppError, badRequest, conflict, forbidden, notFound } from '../common/errors';
 import { DbService } from '../db/db.service';
 import { renderETicket } from '../documents/eticket';
+import { renderHotelVoucher } from '../documents/voucher';
 import { OutboxService } from '../events/outbox.service';
 import { FlightSearchService } from '../flights/flight-search.service';
-import { SupplierRegistry } from '../flights/supplier-registry';
+import { HotelSupplierRegistry, SupplierRegistry } from '../flights/supplier-registry';
+import { HotelSearchService } from '../hotels/hotel-search.service';
 import { LedgerService } from '../payments/ledger.service';
+import { PriceQuote } from '../pricing/pricing-engine';
 import { PricingService } from '../pricing/pricing.service';
 import { TenancyService } from '../tenancy/tenancy.service';
 
@@ -21,16 +34,35 @@ export interface CreateBookingInput {
   expectedSellAmount?: number;
 }
 
-interface BookingRow {
+export interface CreateHotelBookingInput {
+  rateId: string;
+  guests: HotelGuest[];
+  contact: { email: string; phone: string };
+  specialRequests?: string;
+  expectedSellAmount?: number;
+}
+
+export interface HotelSnapshot {
+  kind: 'hotel';
+  hotel: { id: string; name: string; city: string; address: string; stars: number };
+  rate: HotelRate;
+  request: HotelSearchRequest;
+  specialRequests?: string;
+}
+
+type Product = 'flight' | 'hotel';
+
+export interface BookingRow {
   id: string;
   reference: string;
   tenant_id: string;
   tenant_path: string;
   created_by: string;
+  product: Product;
   status: string;
   supplier: string;
-  offer_snapshot: FlightOffer;
-  passengers: Passenger[];
+  offer_snapshot: FlightOffer & HotelSnapshot;
+  passengers: (Passenger | HotelGuest)[];
   contact: { email: string; phone: string };
   currency: string;
   net_amount: number;
@@ -40,6 +72,7 @@ interface BookingRow {
   pnr: string | null;
   hold_expires_at: Date | null;
   ticket_numbers: string[];
+  fulfilment: Record<string, unknown>;
   failure_reason: string | null;
   ops_resolved_at: Date | null;
   ops_note: string | null;
@@ -48,22 +81,29 @@ interface BookingRow {
 }
 
 const SELECT = `SELECT *, tenant_path::text AS tenant_path FROM booking.booking`;
+const RETURNING = `RETURNING *, tenant_path::text AS tenant_path`;
 const TICKET_ATTEMPTS = 2;
+/** Hotels have no supplier-side hold; the checked price is honoured for this long. */
+const HOTEL_PRICE_LOCK_MINUTES = 20;
 
 /** Booking history entries that other modules (notifications, reporting) hear about. */
 const PUBLIC_EVENTS: Record<string, string> = {
   held: 'booking.held',
   paid: 'booking.paid',
   ticketed: 'booking.confirmed',
+  confirmed: 'booking.confirmed',
   ticketing_failed: 'booking.failed',
+  booking_failed: 'booking.failed',
   cancelled: 'booking.cancelled',
   expired: 'booking.expired',
 };
 
 /**
- * Flight booking saga: reprice -> hold -> pay -> ticket -> confirm.
- * Each step is persisted with an event, so a step can be retried or compensated:
- * a failed ticket after payment is refunded automatically and flagged for operations.
+ * Booking saga for every product: price check -> hold -> pay -> fulfil -> confirm.
+ * Holding, paying, refunding and the history are shared; each product supplies its own way to
+ * create, fulfil (ticket a flight, book a hotel room), release and cancel.
+ * Every step is persisted with an event, so it can be retried or compensated: a failed
+ * fulfilment after payment is refunded automatically and flagged for operations.
  */
 @Injectable()
 export class BookingService {
@@ -73,18 +113,18 @@ export class BookingService {
     private readonly db: DbService,
     private readonly search: FlightSearchService,
     private readonly registry: SupplierRegistry,
+    private readonly hotelSearch: HotelSearchService,
+    private readonly hotelRegistry: HotelSupplierRegistry,
     private readonly pricing: PricingService,
     private readonly ledger: LedgerService,
     private readonly tenancy: TenancyService,
     private readonly outbox: OutboxService,
   ) {}
 
+  // ---------- create ----------
+
   async create(user: AuthUser, input: CreateBookingInput, idempotencyKey: string | undefined, traceId: string) {
-    if (!idempotencyKey) throw badRequest('Idempotency-Key header is required to create a booking');
-    const existing = await this.db.one<BookingRow>(`${SELECT} WHERE tenant_id = $1 AND idempotency_key = $2`, [
-      user.tenantId,
-      idempotencyKey,
-    ]);
+    const existing = await this.existing(user, idempotencyKey);
     if (existing) return this.view(user, existing);
     if (!input.passengers.some((p) => p.type === 'ADT')) throw badRequest('At least one adult passenger is required');
 
@@ -93,64 +133,53 @@ export class BookingService {
     const offer = await this.registry.call(cached.supplier, ctx, (s) => s.reprice(cached, ctx));
     const pricer = await this.pricing.pricerFor(user.tenantPath);
     const quote = pricer(offer.price.total, this.search.pricingContext(undefined, offer));
-
-    if (input.expectedSellAmount !== undefined && input.expectedSellAmount !== quote.sell.amount) {
-      throw conflict('PRICE_CHANGED', 'The price changed since you searched. Confirm the new price to continue.', {
-        previousSellAmount: input.expectedSellAmount,
-        newSellAmount: quote.sell.amount,
-        currency: quote.sell.currency,
-      });
-    }
+    this.checkExpectedPrice(input.expectedSellAmount, quote);
 
     const hold = await this.registry.call(offer.supplier, ctx, (s) => s.hold(offer, input.passengers, ctx));
-    const reference = newReference();
-    try {
-      const row = await this.db.tx(async (client) => {
-        const { rows } = await client.query<BookingRow>(
-          `INSERT INTO booking.booking (reference, tenant_id, tenant_path, created_by, channel, status, supplier,
-             offer_snapshot, passengers, contact, currency, net_amount, agent_cost_amount, sell_amount,
-             pricing_breakdown, pnr, hold_expires_at, idempotency_key)
-           VALUES ($1,$2,$3::ltree,$4,'b2b','held',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-           RETURNING *, tenant_path::text AS tenant_path`,
-          [
-            reference,
-            user.tenantId,
-            user.tenantPath,
-            user.id,
-            offer.supplier,
-            JSON.stringify(offer),
-            JSON.stringify(input.passengers),
-            JSON.stringify(input.contact),
-            quote.sell.currency,
-            quote.net.amount,
-            quote.agentCost.amount,
-            quote.sell.amount,
-            JSON.stringify(quote.breakdown),
-            hold.pnr,
-            hold.holdExpiresAt ?? null,
-            idempotencyKey,
-          ],
-        );
-        await this.event(client, rows[0], 'held', { pnr: hold.pnr, traceId, by: user.id });
-        return rows[0];
-      });
-      return this.view(user, row);
-    } catch (err) {
-      // Two requests with the same key raced: release our duplicate hold, return the winner.
-      if ((err as { code?: string }).code === '23505') {
-        await this.registry.call(offer.supplier, ctx, (s) => s.cancel(hold, ctx)).catch(() => undefined);
-        const winner = await this.db.one<BookingRow>(`${SELECT} WHERE tenant_id = $1 AND idempotency_key = $2`, [
-          user.tenantId,
-          idempotencyKey,
-        ]);
-        if (winner) return this.view(user, winner);
-      }
-      throw err;
-    }
+    return this.insertHeld(user, idempotencyKey!, traceId, {
+      product: 'flight',
+      supplier: offer.supplier,
+      snapshot: offer,
+      passengers: input.passengers,
+      contact: input.contact,
+      quote,
+      pnr: hold.pnr,
+      holdExpiresAt: hold.holdExpiresAt ?? null,
+      release: () => this.registry.call(offer.supplier, ctx, (s) => s.cancel(hold, ctx)).then(() => undefined),
+    });
   }
 
+  async createHotel(user: AuthUser, input: CreateHotelBookingInput, idempotencyKey: string | undefined, traceId: string) {
+    const existing = await this.existing(user, idempotencyKey);
+    if (existing) return this.view(user, existing);
+    const cached = await this.hotelSearch.getRate(input.rateId);
+    if (input.guests.length !== cached.request.rooms.length) {
+      throw badRequest(`Give one lead guest per room (${cached.request.rooms.length})`);
+    }
+    const ctx = { ...this.hotelSearch.ctx(user, traceId), idempotencyKey };
+    const rate = await this.hotelRegistry.call(cached.rate.supplier, ctx, (s) => s.checkRate(cached.rate, cached.request, ctx));
+    const pricer = await this.pricing.pricerFor(user.tenantPath);
+    const quote = pricer(rate.price.total, this.hotelSearch.pricingContext(cached.request, rate));
+    this.checkExpectedPrice(input.expectedSellAmount, quote);
+
+    const hotel = await this.hotelContent(cached.hotelId);
+    const snapshot: HotelSnapshot = { kind: 'hotel', hotel, rate, request: cached.request, specialRequests: input.specialRequests };
+    return this.insertHeld(user, idempotencyKey!, traceId, {
+      product: 'hotel',
+      supplier: rate.supplier,
+      snapshot,
+      passengers: input.guests,
+      contact: input.contact,
+      quote,
+      pnr: null,
+      holdExpiresAt: new Date(Date.now() + HOTEL_PRICE_LOCK_MINUTES * 60_000).toISOString(),
+    });
+  }
+
+  // ---------- pay and fulfil ----------
+
   async pay(user: AuthUser, reference: string, traceId: string) {
-    const operatorId = (await this.tenancy.ancestors(user.tenantPath))[0].id;
+    const operatorId = await this.operatorIdFor(user.tenantPath);
 
     const charged = await this.db.tx(async (client) => {
       const b = await this.lockInScope(client, user, reference);
@@ -161,32 +190,118 @@ export class BookingService {
       }
       await this.ledger.chargeBooking(client, b.tenant_id, operatorId, money(b.agent_cost_amount, b.currency), b.reference);
       const { rows } = await client.query<BookingRow>(
-        `UPDATE booking.booking SET status = 'ticketing', updated_at = now() WHERE id = $1 RETURNING *, tenant_path::text AS tenant_path`,
+        `UPDATE booking.booking SET status = 'ticketing', updated_at = now() WHERE id = $1 ${RETURNING}`,
         [b.id],
       );
       await this.event(client, b, 'paid', { amount: b.agent_cost_amount, currency: b.currency, traceId, by: user.id });
       return { booking: rows[0], charged: true };
     });
 
-    // Already paid by an earlier (or concurrent) request: report its current state, never charge or ticket twice.
+    // Already paid by an earlier (or concurrent) request: report its current state, never charge twice.
     if (!charged.charged) return this.view(user, charged.booking);
-    // Money is taken and committed; ticketing happens outside that transaction.
-    // A booking left in 'ticketing' by a crash is picked up by the recovery job (see README, next steps).
-    return this.view(user, await this.ticket(charged.booking, operatorId, traceId));
+    // Money is taken and committed; fulfilment happens outside that transaction.
+    return this.view(user, await this.fulfil(charged.booking, operatorId, traceId));
   }
+
+  private fulfil(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
+    return b.product === 'hotel' ? this.bookHotel(b, operatorId, traceId) : this.ticketFlight(b, operatorId, traceId);
+  }
+
+  private async ticketFlight(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000, idempotencyKey: `ticket:${b.reference}` };
+    const ref = { supplier: b.supplier, pnr: b.pnr!, holdExpiresAt: b.hold_expires_at?.toISOString() };
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= TICKET_ATTEMPTS; attempt++) {
+      try {
+        const result = await this.registry.call(b.supplier, ctx, (s) => s.ticket(ref, ctx));
+        return this.succeed(b, { ticketNumbers: result.ticketNumbers }, 'ticketed', { ticketNumbers: result.ticketNumbers, attempt, traceId });
+      } catch (err) {
+        lastError = err;
+        this.logger.warn({ traceId, booking: b.reference, attempt }, `Ticketing failed: ${(err as Error).message}`);
+        const retryable =
+          !(err instanceof SupplierError) ||
+          ([SupplierErrorCode.SUPPLIER_TIMEOUT, SupplierErrorCode.TICKETING_FAILED, SupplierErrorCode.SUPPLIER_UNAVAILABLE] as string[]).includes(
+            err.code,
+          );
+        if (!retryable) break;
+      }
+    }
+    const reason = lastError instanceof SupplierError ? lastError.code : SupplierErrorCode.TICKETING_FAILED;
+    return this.failAndRefund(b, operatorId, reason, 'ticketing_failed', traceId);
+  }
+
+  /**
+   * Books the room. Deliberately a single attempt: a retried hotel booking can create a second
+   * reservation. A timeout is ambiguous, so it is refunded and left for operations to check with
+   * the supplier.
+   */
+  private async bookHotel(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
+    const snap = b.offer_snapshot as HotelSnapshot;
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000, idempotencyKey: `book:${b.reference}` };
+    try {
+      const result = await this.hotelRegistry.call(b.supplier, ctx, (s) =>
+        s.book(snap.rate, snap.request, b.passengers as HotelGuest[], ctx),
+      );
+      return this.succeed(
+        b,
+        { pnr: result.supplierReference, fulfilment: { supplierReference: result.supplierReference, hotelConfirmation: result.hotelConfirmation } },
+        'confirmed',
+        { supplierReference: result.supplierReference, hotelConfirmation: result.hotelConfirmation, traceId },
+      );
+    } catch (err) {
+      this.logger.warn({ traceId, booking: b.reference }, `Hotel booking failed: ${(err as Error).message}`);
+      const reason = err instanceof SupplierError ? err.code : SupplierErrorCode.BOOKING_FAILED;
+      return this.failAndRefund(b, operatorId, reason, 'booking_failed', traceId);
+    }
+  }
+
+  private succeed(
+    b: BookingRow,
+    result: { ticketNumbers?: string[]; pnr?: string; fulfilment?: Record<string, unknown> },
+    eventType: string,
+    eventData: Record<string, unknown>,
+  ): Promise<BookingRow> {
+    return this.db.tx(async (client) => {
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'confirmed', ticket_numbers = COALESCE($2, ticket_numbers),
+                pnr = COALESCE($3, pnr), fulfilment = fulfilment || $4::jsonb, updated_at = now()
+          WHERE id = $1 ${RETURNING}`,
+        [b.id, result.ticketNumbers ?? null, result.pnr ?? null, JSON.stringify(result.fulfilment ?? {})],
+      );
+      await this.event(client, b, eventType, eventData);
+      return rows[0];
+    });
+  }
+
+  private failAndRefund(b: BookingRow, operatorId: string, reason: string, eventType: string, traceId: string): Promise<BookingRow> {
+    return this.db.tx(async (client) => {
+      await this.ledger.refundBooking(client, b.tenant_id, operatorId, money(b.agent_cost_amount, b.currency), b.reference);
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'failed', failure_reason = $2, updated_at = now() WHERE id = $1 ${RETURNING}`,
+        [b.id, reason],
+      );
+      await this.event(client, b, eventType, { reason, traceId });
+      await this.event(client, b, 'refunded', { amount: b.agent_cost_amount, currency: b.currency });
+      return rows[0];
+    });
+  }
+
+  // ---------- cancel ----------
 
   async cancel(user: AuthUser, reference: string, traceId: string) {
     const b = await this.getRow(user, reference);
     if (b.status === 'cancelled') return this.view(user, b);
+    if (b.status === 'confirmed' && b.product === 'hotel') return this.view(user, await this.cancelConfirmedHotel(user, b, traceId));
     if (b.status !== 'held') {
-      throw conflict('INVALID_STATE', 'Only held bookings can be cancelled here. Raise an offline change request for ticketed bookings.');
+      throw conflict(
+        'INVALID_STATE',
+        'Only held bookings can be cancelled here. Raise an offline change request for ticketed flights.',
+      );
     }
-    const ctx = this.search.ctx(user, traceId);
-    await this.registry.call(b.supplier, ctx, (s) => s.cancel({ supplier: b.supplier, pnr: b.pnr! }, ctx));
+    await this.release(b, traceId);
     const row = await this.db.tx(async (client) => {
       const { rows } = await client.query<BookingRow>(
-        `UPDATE booking.booking SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'held'
-         RETURNING *, tenant_path::text AS tenant_path`,
+        `UPDATE booking.booking SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'held' ${RETURNING}`,
         [b.id],
       );
       if (rows[0]) await this.event(client, b, 'cancelled', { traceId, by: user.id });
@@ -195,10 +310,48 @@ export class BookingService {
     return this.view(user, row);
   }
 
-  async list(user: AuthUser, filter: { status?: string; limit: number }) {
+  /**
+   * Cancels a confirmed hotel stay with the supplier. The agency gets back what it paid, reduced in
+   * proportion to the supplier's penalty (a penalty of the full net price refunds nothing).
+   */
+  private async cancelConfirmedHotel(user: AuthUser, b: BookingRow, traceId: string): Promise<BookingRow> {
+    if (b.tenant_id !== user.tenantId && !hasRole(user, 'ops')) throw forbidden('Only the booking agency can cancel this stay');
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000 };
+    const result = await this.hotelRegistry.call(b.supplier, ctx, (s) => s.cancel(b.pnr!, ctx));
+    if (!result.cancelled) throw conflict('CANCEL_REJECTED', 'The hotel supplier did not accept the cancellation');
+    const penaltyShare = Math.min(1, result.penalty.amount / Math.max(b.net_amount, 1));
+    const refund = Math.max(0, Math.round(b.agent_cost_amount * (1 - penaltyShare)));
+    const operatorId = await this.operatorIdFor(b.tenant_path);
+    return this.db.tx(async (client) => {
+      if (refund > 0) await this.ledger.refundBooking(client, b.tenant_id, operatorId, money(refund, b.currency), b.reference);
+      const cancellation = { penalty: result.penalty, refunded: { amount: refund, currency: b.currency } };
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'cancelled', fulfilment = fulfilment || $2::jsonb, updated_at = now()
+          WHERE id = $1 ${RETURNING}`,
+        [b.id, JSON.stringify({ cancellation })],
+      );
+      await this.event(client, b, 'cancelled', { traceId, by: user.id, ...cancellation });
+      if (refund > 0) await this.event(client, b, 'refunded', { amount: refund, currency: b.currency });
+      return rows[0];
+    });
+  }
+
+  /** Gives back whatever the supplier is holding for an unpaid booking. Hotels hold nothing. */
+  private async release(b: BookingRow, traceId: string) {
+    if (b.product !== 'flight' || !b.pnr) return;
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 15_000 };
+    await this.registry.call(b.supplier, ctx, (s) => s.cancel({ supplier: b.supplier, pnr: b.pnr! }, ctx));
+  }
+
+  // ---------- read ----------
+
+  async list(user: AuthUser, filter: { status?: string; product?: string; limit: number }) {
+    const wholeSubtree = hasRole(user, 'admin', 'ops', 'finance');
     const { rows } = await this.db.query<BookingRow>(
-      `${SELECT} WHERE tenant_path <@ $1::ltree AND ($2::text IS NULL OR status = $2) ORDER BY created_at DESC LIMIT $3`,
-      [this.scopePath(user), filter.status ?? null, filter.limit],
+      `${SELECT} WHERE tenant_path <@ $1::ltree AND ($5 OR tenant_path = $1::ltree)
+         AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR product = $3)
+       ORDER BY created_at DESC LIMIT $4`,
+      [user.tenantPath, filter.status ?? null, filter.product ?? null, filter.limit, wholeSubtree],
     );
     return rows.map((r) => this.view(user, r));
   }
@@ -212,11 +365,32 @@ export class BookingService {
     return { ...this.view(user, b), events };
   }
 
-  /** PDF e-ticket receipt, available once the booking is ticketed. */
-  async eticket(user: AuthUser, reference: string): Promise<{ filename: string; pdf: Buffer }> {
+  /** The traveller document: e-ticket receipt for flights, accommodation voucher for hotels. */
+  async document(user: AuthUser, reference: string): Promise<{ filename: string; pdf: Buffer }> {
     const b = await this.getRow(user, reference);
-    if (b.status !== 'confirmed') throw conflict('INVALID_STATE', 'E-tickets are available once the booking is ticketed');
+    if (b.status !== 'confirmed') throw conflict('INVALID_STATE', 'Documents are available once the booking is confirmed');
     const issuer = await this.tenancy.get(b.tenant_id);
+    const total = `${b.currency} ${(b.sell_amount / 100).toFixed(2)}`;
+    if (b.product === 'hotel') {
+      const s = b.offer_snapshot as HotelSnapshot;
+      const pdf = await renderHotelVoucher({
+        reference: b.reference,
+        issuedBy: issuer.name,
+        supplierReference: b.pnr ?? '',
+        hotelConfirmation: (b.fulfilment.hotelConfirmation as string) ?? undefined,
+        hotel: s.hotel,
+        checkIn: s.request.checkIn,
+        checkOut: s.request.checkOut,
+        nights: nightsBetween(s.request.checkIn, s.request.checkOut),
+        rooms: s.request.rooms.map((r, i) => ({ adults: r.adults, children: r.childAges?.length ?? 0, guest: b.passengers[i] as HotelGuest })),
+        roomName: s.rate.roomName,
+        board: s.rate.board,
+        specialRequests: s.specialRequests,
+        cancellation: s.rate.refundable ? `Free cancellation until ${s.rate.freeCancellationUntil?.slice(0, 10)}` : 'Non-refundable',
+        total,
+      });
+      return { filename: `voucher-${b.reference}.pdf`, pdf };
+    }
     const bag = b.offer_snapshot.baggage?.[0];
     const pdf = await renderETicket({
       reference: b.reference,
@@ -227,7 +401,7 @@ export class BookingService {
       slices: b.offer_snapshot.slices,
       fareBrand: b.offer_snapshot.fareBrand,
       baggage: bag ? `${bag.checkedPieces} checked piece(s), ${bag.cabinKg} kg cabin` : undefined,
-      total: `${b.currency} ${(b.sell_amount / 100).toFixed(2)}`,
+      total,
     });
     return { filename: `eticket-${b.reference}.pdf`, pdf };
   }
@@ -235,7 +409,7 @@ export class BookingService {
   // ---------- background jobs ----------
 
   /**
-   * Marks holds past their time limit as expired and releases the seats with the supplier.
+   * Marks holds past their time limit as expired and releases anything the supplier holds.
    * Rows are claimed by the UPDATE itself, so concurrent runners never expire one booking twice.
    */
   async expireHolds(batch = 100): Promise<string[]> {
@@ -244,15 +418,14 @@ export class BookingService {
         `UPDATE booking.booking SET status = 'expired', updated_at = now()
           WHERE id IN (SELECT id FROM booking.booking WHERE status = 'held' AND hold_expires_at < now()
                         ORDER BY hold_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED)
-          RETURNING *, tenant_path::text AS tenant_path`,
+          ${RETURNING}`,
         [batch],
       );
       for (const b of rows) await this.event(client, b, 'expired', { holdExpiresAt: b.hold_expires_at });
       return rows;
     });
     for (const b of expired) {
-      const ctx = { traceId: 'job:expire-holds', tenantId: b.tenant_id, timeoutMs: 15_000 };
-      await this.registry.call(b.supplier, ctx, (s) => s.cancel({ supplier: b.supplier, pnr: b.pnr! }, ctx)).catch((err) =>
+      await this.release(b, 'job:expire-holds').catch((err) =>
         this.logger.warn(`Could not release expired hold ${b.reference}: ${(err as Error).message}`),
       );
     }
@@ -260,21 +433,22 @@ export class BookingService {
   }
 
   /**
-   * Finishes bookings that were paid but never reached confirmed or failed, for example because
-   * the process died mid-ticketing. Supplier ticketing is idempotent per PNR, and the refund is
-   * idempotent per booking, so retrying is safe.
+   * Finishes flight bookings that were paid but never reached confirmed or failed, for example
+   * because the process died mid-ticketing. Ticketing is idempotent per PNR and the refund is
+   * idempotent per booking, so retrying is safe. Stuck hotel bookings are NOT retried (a second
+   * attempt could book a second room); they stay in the operations queue for a person to check.
    */
   async recoverStuckTicketing(olderThanSeconds = 300, batch = 20): Promise<string[]> {
     const { rows } = await this.db.query<BookingRow>(
       `UPDATE booking.booking SET updated_at = now()
-        WHERE id IN (SELECT id FROM booking.booking WHERE status = 'ticketing'
+        WHERE id IN (SELECT id FROM booking.booking WHERE status = 'ticketing' AND product = 'flight'
                       AND updated_at < now() - make_interval(secs => $1) LIMIT $2 FOR UPDATE SKIP LOCKED)
-        RETURNING *, tenant_path::text AS tenant_path`,
+        ${RETURNING}`,
       [olderThanSeconds, batch],
     );
     const done: string[] = [];
     for (const b of rows) {
-      const result = await this.ticket(b, await this.operatorIdFor(b.tenant_path), 'job:recover-ticketing');
+      const result = await this.ticketFlight(b, await this.operatorIdFor(b.tenant_path), 'job:recover-ticketing');
       done.push(`${b.reference}:${result.status}`);
     }
     return done;
@@ -282,7 +456,7 @@ export class BookingService {
 
   // ---------- operations ----------
 
-  /** Bookings that need a person: failed and not yet resolved, or stuck in ticketing. */
+  /** Bookings that need a person: failed and not yet resolved, or stuck in fulfilment. */
   async opsQueue(user: AuthUser) {
     if (!hasRole(user, 'ops', 'admin')) throw forbidden('Operations access required');
     const { rows } = await this.db.query<BookingRow>(
@@ -302,7 +476,7 @@ export class BookingService {
     const row = await this.db.tx(async (client) => {
       const { rows } = await client.query<BookingRow>(
         `UPDATE booking.booking SET ops_resolved_at = now(), ops_resolved_by = $2, ops_note = $3, updated_at = now()
-          WHERE id = $1 RETURNING *, tenant_path::text AS tenant_path`,
+          WHERE id = $1 ${RETURNING}`,
         [b.id, user.id, note],
       );
       await this.event(client, b, 'ops_resolved', { note, by: user.id });
@@ -311,57 +485,95 @@ export class BookingService {
     return this.view(user, row);
   }
 
+  // ---------- helpers ----------
+
+  private async existing(user: AuthUser, idempotencyKey: string | undefined): Promise<BookingRow | undefined> {
+    if (!idempotencyKey) throw badRequest('Idempotency-Key header is required to create a booking');
+    return this.db.one<BookingRow>(`${SELECT} WHERE tenant_id = $1 AND idempotency_key = $2`, [user.tenantId, idempotencyKey]);
+  }
+
+  private checkExpectedPrice(expected: number | undefined, quote: PriceQuote) {
+    if (expected !== undefined && expected !== quote.sell.amount) {
+      throw conflict('PRICE_CHANGED', 'The price changed since you searched. Confirm the new price to continue.', {
+        previousSellAmount: expected,
+        newSellAmount: quote.sell.amount,
+        currency: quote.sell.currency,
+      });
+    }
+  }
+
+  private async insertHeld(
+    user: AuthUser,
+    idempotencyKey: string,
+    traceId: string,
+    p: {
+      product: Product;
+      supplier: string;
+      snapshot: object;
+      passengers: object[];
+      contact: object;
+      quote: PriceQuote;
+      pnr: string | null;
+      holdExpiresAt: string | null;
+      release?: () => Promise<void>;
+    },
+  ) {
+    try {
+      const row = await this.db.tx(async (client) => {
+        const { rows } = await client.query<BookingRow>(
+          `INSERT INTO booking.booking (reference, tenant_id, tenant_path, created_by, channel, product, status, supplier,
+             offer_snapshot, passengers, contact, currency, net_amount, agent_cost_amount, sell_amount,
+             pricing_breakdown, pnr, hold_expires_at, idempotency_key)
+           VALUES ($1,$2,$3::ltree,$4,'b2b',$5,'held',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ${RETURNING}`,
+          [
+            newReference(),
+            user.tenantId,
+            user.tenantPath,
+            user.id,
+            p.product,
+            p.supplier,
+            JSON.stringify(p.snapshot),
+            JSON.stringify(p.passengers),
+            JSON.stringify(p.contact),
+            p.quote.sell.currency,
+            p.quote.net.amount,
+            p.quote.agentCost.amount,
+            p.quote.sell.amount,
+            JSON.stringify(p.quote.breakdown),
+            p.pnr,
+            p.holdExpiresAt,
+            idempotencyKey,
+          ],
+        );
+        await this.event(client, rows[0], 'held', { pnr: p.pnr, traceId, by: user.id });
+        return rows[0];
+      });
+      return this.view(user, row);
+    } catch (err) {
+      // Two requests with the same key raced: release our duplicate hold, return the winner.
+      if ((err as { code?: string }).code === '23505') {
+        await p.release?.().catch(() => undefined);
+        const winner = await this.db.one<BookingRow>(`${SELECT} WHERE tenant_id = $1 AND idempotency_key = $2`, [
+          user.tenantId,
+          idempotencyKey,
+        ]);
+        if (winner) return this.view(user, winner);
+      }
+      throw err;
+    }
+  }
+
+  private async hotelContent(hotelId: string) {
+    const row = await this.db.one(`SELECT id, name, city, address, stars FROM hotels.hotel WHERE id = $1`, [hotelId]);
+    if (!row) throw notFound('Hotel');
+    return row as HotelSnapshot['hotel'];
+  }
+
   private async operatorIdFor(tenantPath: string): Promise<string> {
     return (await this.tenancy.ancestors(tenantPath))[0].id;
   }
 
-  private async ticket(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
-    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000, idempotencyKey: `ticket:${b.reference}` };
-    const ref = { supplier: b.supplier, pnr: b.pnr!, holdExpiresAt: b.hold_expires_at?.toISOString() };
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= TICKET_ATTEMPTS; attempt++) {
-      try {
-        const result = await this.registry.call(b.supplier, ctx, (s) => s.ticket(ref, ctx));
-        return this.db.tx(async (client) => {
-          const { rows } = await client.query<BookingRow>(
-            `UPDATE booking.booking SET status = 'confirmed', ticket_numbers = $2, updated_at = now() WHERE id = $1
-             RETURNING *, tenant_path::text AS tenant_path`,
-            [b.id, result.ticketNumbers],
-          );
-          await this.event(client, b, 'ticketed', { ticketNumbers: result.ticketNumbers, attempt, traceId });
-          return rows[0];
-        });
-      } catch (err) {
-        lastError = err;
-        this.logger.warn({ traceId, booking: b.reference, attempt }, `Ticketing failed: ${(err as Error).message}`);
-        const retryable =
-          !(err instanceof SupplierError) ||
-          ([SupplierErrorCode.SUPPLIER_TIMEOUT, SupplierErrorCode.TICKETING_FAILED, SupplierErrorCode.SUPPLIER_UNAVAILABLE] as string[]).includes(
-            err.code,
-          );
-        if (!retryable) break;
-      }
-    }
-    const reason = lastError instanceof SupplierError ? lastError.code : 'TICKETING_FAILED';
-    return this.db.tx(async (client) => {
-      await this.ledger.refundBooking(client, b.tenant_id, operatorId, money(b.agent_cost_amount, b.currency), b.reference);
-      const { rows } = await client.query<BookingRow>(
-        `UPDATE booking.booking SET status = 'failed', failure_reason = $2, updated_at = now() WHERE id = $1
-         RETURNING *, tenant_path::text AS tenant_path`,
-        [b.id, reason],
-      );
-      await this.event(client, b, 'ticketing_failed', { reason, traceId });
-      await this.event(client, b, 'refunded', { amount: b.agent_cost_amount, currency: b.currency });
-      // Ops queue: failed bookings are listed for operations by status = 'failed'.
-      return rows[0];
-    });
-  }
-
-  /** Agents see their own tenant's bookings; admins see their whole subtree. */
-  private scopePath(user: AuthUser): string {
-    return user.tenantPath;
-  }
-
+  /** Agents see their own tenant's bookings; admins, ops and finance see their whole subtree. */
   private canSee(user: AuthUser, b: BookingRow): boolean {
     if (b.tenant_path === user.tenantPath) return true;
     return hasRole(user, 'admin', 'ops', 'finance') && this.tenancy.inScope(user, b.tenant_path);
@@ -384,12 +596,7 @@ export class BookingService {
   }
 
   /** Appends to the booking's own history and, for public state changes, to the outbox in the same transaction. */
-  private async event(
-    client: PoolClient,
-    b: Pick<BookingRow, 'id' | 'reference' | 'tenant_id'>,
-    type: string,
-    data: Record<string, unknown>,
-  ) {
+  private async event(client: PoolClient, b: Pick<BookingRow, 'id' | 'reference' | 'tenant_id'>, type: string, data: Record<string, unknown>) {
     await client.query(`INSERT INTO booking.booking_event (booking_id, type, data) VALUES ($1, $2, $3)`, [
       b.id,
       type,
@@ -401,18 +608,15 @@ export class BookingService {
 
   private view(user: AuthUser, b: BookingRow) {
     const ownMarkup = b.sell_amount - b.agent_cost_amount;
-    return {
+    const common = {
       reference: b.reference,
+      product: b.product,
       status: b.status,
-      supplier: b.supplier,
+      supplier: user.tenantType === 'operator' ? b.supplier : undefined,
       pnr: b.pnr,
       holdExpiresAt: b.hold_expires_at,
-      ticketNumbers: b.ticket_numbers,
       failureReason: b.failure_reason,
       opsResolution: b.ops_resolved_at ? { at: b.ops_resolved_at, note: b.ops_note } : null,
-      itinerary: b.offer_snapshot.slices,
-      fareBrand: b.offer_snapshot.fareBrand,
-      refundable: b.offer_snapshot.refundable,
       passengers: b.passengers,
       contact: b.contact,
       pricing: {
@@ -423,6 +627,31 @@ export class BookingService {
       },
       createdAt: b.created_at,
       updatedAt: b.updated_at,
+    };
+    if (b.product === 'hotel') {
+      const s = b.offer_snapshot as HotelSnapshot;
+      return {
+        ...common,
+        ticketNumbers: [],
+        hotel: s.hotel,
+        stay: {
+          checkIn: s.request.checkIn,
+          checkOut: s.request.checkOut,
+          nights: nightsBetween(s.request.checkIn, s.request.checkOut),
+          rooms: s.request.rooms,
+        },
+        room: { name: s.rate.roomName, board: s.rate.board, refundable: s.rate.refundable, freeCancellationUntil: s.rate.freeCancellationUntil },
+        hotelConfirmation: b.fulfilment.hotelConfirmation ?? null,
+        cancellation: b.fulfilment.cancellation ?? null,
+        specialRequests: s.specialRequests,
+      };
+    }
+    return {
+      ...common,
+      ticketNumbers: b.ticket_numbers,
+      itinerary: b.offer_snapshot.slices,
+      fareBrand: b.offer_snapshot.fareBrand,
+      refundable: b.offer_snapshot.refundable,
     };
   }
 }

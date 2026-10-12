@@ -1,33 +1,47 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { CallContext, FlightSupplier, SupplierError, SupplierErrorCode } from '@tripwise/contracts';
+import { CallContext, FlightSupplier, HotelSupplier, SupplierError, SupplierErrorCode } from '@tripwise/contracts';
 import { CircuitBreaker, withTimeout } from '@tripwise/supplier-gateway';
 
 export const FLIGHT_SUPPLIERS = Symbol('FLIGHT_SUPPLIERS');
+export const HOTEL_SUPPLIERS = Symbol('HOTEL_SUPPLIERS');
 
 /**
- * Holds every enabled flight supplier with its own circuit breaker. All supplier calls go
- * through `call`, so timeouts and breakers apply everywhere, not just in search.
+ * A set of suppliers of one product, each behind its own circuit breaker. Every supplier call
+ * goes through `call`, so timeouts and breakers apply everywhere, not just in search.
  */
-@Injectable()
-export class SupplierRegistry {
+export class SupplierPool<T extends { code: string }> {
   private readonly breakers = new Map<string, CircuitBreaker>();
-  private readonly byCode = new Map<string, FlightSupplier>();
+  private readonly byCode = new Map<string, T>();
 
-  constructor(@Inject(FLIGHT_SUPPLIERS) readonly suppliers: FlightSupplier[]) {
+  constructor(readonly suppliers: T[]) {
     for (const s of suppliers) {
       this.byCode.set(s.code, s);
       this.breakers.set(s.code, new CircuitBreaker(s.code, { failureThreshold: 5, openMs: 30_000 }));
     }
   }
 
-  get(code: string): FlightSupplier {
+  get(code: string): T {
     const s = this.byCode.get(code);
     if (!s) throw new SupplierError(SupplierErrorCode.SUPPLIER_UNAVAILABLE, `Supplier ${code} is not enabled`, code);
     return s;
   }
 
-  call<T>(code: string, ctx: CallContext, fn: (s: FlightSupplier) => Promise<T>): Promise<T> {
+  call<R>(code: string, ctx: CallContext, fn: (s: T) => Promise<R>): Promise<R> {
     const supplier = this.get(code);
     return this.breakers.get(code)!.call(() => withTimeout(code, ctx.timeoutMs, () => fn(supplier)));
+  }
+}
+
+@Injectable()
+export class SupplierRegistry extends SupplierPool<FlightSupplier> {
+  constructor(@Inject(FLIGHT_SUPPLIERS) suppliers: FlightSupplier[]) {
+    super(suppliers);
+  }
+}
+
+@Injectable()
+export class HotelSupplierRegistry extends SupplierPool<HotelSupplier> {
+  constructor(@Inject(HOTEL_SUPPLIERS) suppliers: HotelSupplier[]) {
+    super(suppliers);
   }
 }

@@ -16,11 +16,12 @@ The first vertical slice: an agency searches flights, books, pays from its walle
 - **Booking saga**: reprice → hold → pay → ticket → confirm, with every step logged as an event. Payment is idempotent and race-safe. A ticketing failure after payment is retried, then refunded automatically.
 - **Ledger**: double-entry, append-only. Wallet balance plus credit limit decides what an agency can spend. Operator finance tops up wallets.
 - **Errors**: every error is `application/problem+json` with a stable `code` and a `traceId`.
+- **Hotels**: search across several suppliers with one result per physical hotel (content mapping by name, city and location), identical rooms collapsed to the best rate, hotel markups, a 20-minute price lock, booking at payment (never retried, to avoid double reservations), vouchers, and cancellation with supplier penalties deducted from the refund.
 - **Events and email**: every booking state change is written to a transactional outbox and delivered to subscribers; customers get emails for holds, tickets, expiries and failures (Mailpit catches them locally).
 - **Background jobs**: hold-expiry sweep (releases seats), recovery of bookings stuck in ticketing after a crash, outbox delivery and email sending. Safe to run on several API instances.
 - **E-ticket PDF** download for ticketed bookings.
 - **Back office**: agencies tree (create, suspend with immediate lock-out), users with one-time passwords, markup rules, wallets with top-ups and credit lines (operator finance), and an operations queue for failed or stuck bookings.
-- **B2B partner portal** (Next.js): sign in, search flights, enter travellers, hold, pay and ticket, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
+- **B2B partner portal** (Next.js): sign in, search flights and hotels, enter travellers or guests, hold, pay and ticket or book, download e-tickets and vouchers, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
 
 ## Repository layout
 
@@ -89,7 +90,7 @@ curl -s -X POST localhost:4000/api/v1/bookings/<reference>/payments -H "authoriz
 
 ### Mock supplier test hooks
 
-The mock supplier simulates failures from the passenger's last name: `SOLDOUT` (hold fails), `BADDATA` (passenger rejected), `TICKETFAIL` (ticketing fails after payment, which triggers the automatic refund). Searches to `MBA` change price at reprice, to exercise `PRICE_CHANGED`.
+The mock hotel suppliers use the lead guest's last name the same way: `SOLDOUT` and `BOOKFAIL`; hotels in `MBA` change price at the price check. The mock flight supplier simulates failures from the passenger's last name: `SOLDOUT` (hold fails), `BADDATA` (passenger rejected), `TICKETFAIL` (ticketing fails after payment, which triggers the automatic refund). Searches to `MBA` change price at reprice, to exercise `PRICE_CHANGED`.
 
 ## Tests
 
@@ -115,8 +116,11 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 | POST | /api/v1/bookings | Hold a booking (Idempotency-Key required) |
 | GET | /api/v1/bookings, /bookings/{ref} | List and view bookings in scope |
 | POST | /api/v1/bookings/{ref}/payments | Pay from wallet and ticket |
-| POST | /api/v1/bookings/{ref}/cancel | Cancel a held booking |
-| GET | /api/v1/bookings/{ref}/eticket.pdf | E-ticket receipt |
+| POST | /api/v1/bookings/{ref}/cancel | Cancel a held booking, or a confirmed hotel stay |
+| POST | /api/v1/hotels/searches | Search hotels (one result per property) |
+| GET | /api/v1/hotels/searches/{searchId}/hotels/{hotelId} | Room offers for one hotel |
+| POST | /api/v1/hotels/bookings | Hold a hotel price (Idempotency-Key required) |
+| GET | /api/v1/bookings/{ref}/document.pdf | E-ticket (flights) or voucher (hotels) |
 | PATCH | /api/v1/tenants/{id} | Suspend or reactivate |
 | GET / POST | /api/v1/tenants/{id}/users | List / create users |
 | GET | /api/v1/accounts | Wallets in scope (admin, finance) |
@@ -130,8 +134,7 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 
 Following the delivery plan, Phase 1:
 
-1. Hotels: supplier contract, search, room rates, booking and vouchers.
-2. Corporate travel (B2E): policies, approvals.
+1. Corporate travel (B2E): policies, approvals.
 3. Own flight inventory (A2A, charters, blocked seats) and travel insurance.
 4. Holiday packages and visa services.
 5. B2C website, front-office desk (POS) and the AI agent.

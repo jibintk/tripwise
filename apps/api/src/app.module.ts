@@ -1,7 +1,7 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
-import { MockFlightSupplier } from '@tripwise/supplier-gateway';
+import { MockFlightSupplier, MockHotelSupplier } from '@tripwise/supplier-gateway';
 import { AuthController } from './auth/auth.controller';
 import { AuthGuard } from './auth/auth.guard';
 import { AuthService } from './auth/auth.service';
@@ -14,7 +14,10 @@ import { APP_CONFIG, AppConfig, loadConfig } from './config';
 import { DbService } from './db/db.service';
 import { FlightSearchService } from './flights/flight-search.service';
 import { FlightsController } from './flights/flights.controller';
-import { FLIGHT_SUPPLIERS, SupplierRegistry } from './flights/supplier-registry';
+import { FLIGHT_SUPPLIERS, HOTEL_SUPPLIERS, HotelSupplierRegistry, SupplierRegistry } from './flights/supplier-registry';
+import { HotelContentService } from './hotels/hotel-content.service';
+import { HotelSearchService } from './hotels/hotel-search.service';
+import { HotelsController } from './hotels/hotels.controller';
 import { HealthController } from './health.controller';
 import { OpsController } from './bookings/ops.controller';
 import { OutboxService } from './events/outbox.service';
@@ -48,11 +51,20 @@ import { TenancyService } from './tenancy/tenancy.service';
     FlightsController,
     BookingsController,
     OpsController,
+    HotelsController,
   ],
   providers: [
     { provide: APP_CONFIG, useFactory: () => loadConfig() },
     // Real adapters (Amadeus, an NDC aggregator, own inventory) are added here as they are certified.
     { provide: FLIGHT_SUPPLIERS, useFactory: () => [new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] })] },
+    // Two mock hotel suppliers that overlap, so content mapping and best-rate selection are exercised.
+    {
+      provide: HOTEL_SUPPLIERS,
+      useFactory: () => [
+        new MockHotelSupplier({ variant: 'a', priceChangeCities: ['MBA'] }),
+        new MockHotelSupplier({ variant: 'b', priceChangeCities: ['MBA'] }),
+      ],
+    },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_FILTER, useClass: ProblemFilter },
     DbService,
@@ -62,6 +74,9 @@ import { TenancyService } from './tenancy/tenancy.service';
     PricingService,
     LedgerService,
     SupplierRegistry,
+    HotelSupplierRegistry,
+    HotelContentService,
+    HotelSearchService,
     FlightSearchService,
     BookingService,
     OutboxService,

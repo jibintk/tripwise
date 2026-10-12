@@ -38,6 +38,8 @@ const STATUS_LABEL: Record<string, string> = {
   expired: 'Hold expired',
 };
 
-export function statusLabel(status: string): string {
+export function statusLabel(status: string, product: string = 'flight'): string {
+  if (product !== 'flight' && status === 'confirmed') return 'Confirmed';
+  if (product !== 'flight' && status === 'ticketing') return 'Booking';
   return STATUS_LABEL[status] ?? status;
 }

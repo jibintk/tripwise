@@ -36,15 +36,26 @@ export class NotificationService {
     const render = TEMPLATES[event.type];
     const b = await this.db.one(`SELECT * FROM booking.booking WHERE reference = $1`, [event.aggregateId]);
     if (!render || !b) return;
-    const first = b.offer_snapshot.slices[0].segments[0];
-    const lastSeg = b.offer_snapshot.slices[0].segments.at(-1);
+    let route: string;
+    let departure: string;
+    if (b.product === 'hotel') {
+      const s = b.offer_snapshot;
+      route = `${s.hotel.name}, ${s.hotel.city}`;
+      departure = `check-in ${s.request.checkIn}, check-out ${s.request.checkOut}`;
+    } else {
+      const first = b.offer_snapshot.slices[0].segments[0];
+      const lastSeg = b.offer_snapshot.slices[0].segments.at(-1);
+      route = `${first.origin} to ${lastSeg.destination}${b.offer_snapshot.slices.length > 1 ? ' and back' : ''}`;
+      departure = first.departureLocal.replace('T', ' ').slice(0, 16);
+    }
     const view: T.BookingView = {
       reference: b.reference,
+      product: b.product,
       pnr: b.pnr,
       passengers: b.passengers,
       ticketNumbers: b.ticket_numbers,
-      route: `${first.origin} to ${lastSeg.destination}${b.offer_snapshot.slices.length > 1 ? ' and back' : ''}`,
-      departure: first.departureLocal.replace('T', ' ').slice(0, 16),
+      route,
+      departure,
       sell: `${b.currency} ${(Number(b.sell_amount) / 100).toFixed(2)}`,
       holdExpiresAt: b.hold_expires_at ? new Date(b.hold_expires_at).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : null,
       failureReason: b.failure_reason,

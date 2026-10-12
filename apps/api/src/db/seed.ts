@@ -94,13 +94,15 @@ export async function seed(pool: Pool): Promise<void> {
     const rule = (owner: string, name: string, valueType: string, value: number, extra: Record<string, unknown> = {}) =>
       client.query(
         `INSERT INTO pricing.pricing_rule (owner_tenant_id, name, product, value_type, value, currency, destination, priority)
-         VALUES ($1,$2,'flight',$3,$4,$5,$6,$7)`,
-        [ids[owner], name, valueType, value, valueType === 'fixed' ? 'USD' : null, extra.destination ?? null, extra.priority ?? 0],
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [ids[owner], name, extra.product ?? 'flight', valueType, value, valueType === 'fixed' ? 'USD' : null, extra.destination ?? null, extra.priority ?? 0],
       );
     await rule('tripwise', 'Operator flight markup', 'percent', 300); // 3%
     await rule('tripwise', 'Operator Zanzibar markup', 'percent', 500, { destination: 'ZNZ' }); // 5% on ZNZ
     await rule('kenya_gsa', 'GSA flight markup', 'percent', 150); // 1.5%
     await rule('safari_desk', 'Agency service fee', 'fixed', 1_500); // USD 15 per booking
+    await rule('tripwise', 'Operator hotel markup', 'percent', 800, { product: 'hotel' }); // 8%
+    await rule('kenya_gsa', 'GSA hotel markup', 'percent', 200, { product: 'hotel' }); // 2%
 
     await client.query('COMMIT');
   } catch (err) {

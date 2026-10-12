@@ -5,7 +5,7 @@ import { Shell } from '@/components/Shell';
 import { api, ApiError, PricingRule, session } from '@/lib/api';
 import { formatMoney } from '@/lib/format';
 
-const blank = { name: '', valueType: 'percent', value: '', origin: '', destination: '', channel: '', cabin: '' };
+const blank = { name: '', product: 'flight', valueType: 'percent', value: '', origin: '', destination: '', channel: '', cabin: '' };
 
 function describe(r: PricingRule): string {
   const scope = [
@@ -41,13 +41,13 @@ export default function PricingPage() {
         method: 'POST',
         body: JSON.stringify({
           name: form.name,
-          product: 'flight',
+          product: form.product,
           valueType: form.valueType,
           value,
-          origin: form.origin || null,
+          origin: form.product === 'flight' ? form.origin || null : null,
           destination: form.destination || null,
           channel: form.channel || null,
-          cabin: form.cabin || null,
+          cabin: form.product === 'flight' ? form.cabin || null : null,
         }),
       });
       setForm(blank);
@@ -116,7 +116,14 @@ export default function PricingPage() {
           </table>
         </div>
         <form className="card stack" onSubmit={create}>
-          <h2>New flight markup</h2>
+          <h2>New markup</h2>
+          <div className="field">
+            <label>Product</label>
+            <select value={form.product} onChange={(e) => setForm({ ...form, product: e.target.value })}>
+              <option value="flight">Flights</option>
+              <option value="hotel">Hotels</option>
+            </select>
+          </div>
           <div className="field">
             <label>Name</label>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Zanzibar season" required />
@@ -133,12 +140,12 @@ export default function PricingPage() {
               <label>{form.valueType === 'percent' ? 'Percent' : `Amount (${me?.tenant.currency})`}</label>
               <input type="number" step="0.01" min="0" value={form.value} onChange={(e) => setForm({ ...form, value: e.target.value })} required />
             </div>
-            <div className="field">
+            <div className="field" style={{ display: form.product === 'flight' ? undefined : 'none' }}>
               <label>From (optional)</label>
               <input maxLength={3} value={form.origin} onChange={(e) => setForm({ ...form, origin: e.target.value.toUpperCase() })} />
             </div>
             <div className="field">
-              <label>To (optional)</label>
+              <label>{form.product === 'flight' ? 'To (optional)' : 'City (optional)'}</label>
               <input maxLength={3} value={form.destination} onChange={(e) => setForm({ ...form, destination: e.target.value.toUpperCase() })} />
             </div>
             <div className="field">
@@ -151,7 +158,7 @@ export default function PricingPage() {
                 <option value="pos">Front office</option>
               </select>
             </div>
-            <div className="field">
+            <div className="field" style={{ display: form.product === 'flight' ? undefined : 'none' }}>
               <label>Cabin</label>
               <select value={form.cabin} onChange={(e) => setForm({ ...form, cabin: e.target.value })}>
                 <option value="">Any</option>

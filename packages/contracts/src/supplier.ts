@@ -46,6 +46,8 @@ export const SupplierErrorCode = {
   HOLD_EXPIRED: 'HOLD_EXPIRED',
   INVALID_PASSENGER_DATA: 'INVALID_PASSENGER_DATA',
   TICKETING_FAILED: 'TICKETING_FAILED',
+  /** Non-flight fulfilment (hotel, insurance, transfer) was rejected after payment. */
+  BOOKING_FAILED: 'BOOKING_FAILED',
   SUPPLIER_UNAVAILABLE: 'SUPPLIER_UNAVAILABLE',
   AUTH_FAILED: 'AUTH_FAILED',
 } as const;

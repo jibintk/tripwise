@@ -45,8 +45,8 @@ export default function BookingsPage() {
           <thead>
             <tr>
               <th>Reference</th>
-              <th>Route</th>
-              <th>Lead traveller</th>
+              <th>Trip</th>
+              <th>Lead guest / traveller</th>
               <th>PNR</th>
               <th>Status</th>
               <th style={{ textAlign: 'right' }}>Customer pays</th>
@@ -68,17 +68,28 @@ export default function BookingsPage() {
               </tr>
             )}
             {bookings?.map((b) => {
-              const first = b.itinerary[0].segments[0];
-              const last = b.itinerary[0].segments[b.itinerary[0].segments.length - 1];
+              const first = b.itinerary?.[0].segments[0];
+              const last = b.itinerary?.[0].segments.at(-1);
               return (
                 <tr key={b.reference}>
                   <td>
                     <Link href={`/bookings/${b.reference}`}>{b.reference}</Link>
                   </td>
                   <td>
-                    {first.origin} → {last.destination}
-                    {b.itinerary.length > 1 ? ' (return)' : ''}
-                    <div className="muted small">{first.departureLocal.slice(0, 10)}</div>
+                    {b.product === 'hotel' ? (
+                      <>
+                        {b.hotel?.name}
+                        <div className="muted small">
+                          Hotel · {b.stay?.checkIn} to {b.stay?.checkOut}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {first?.origin} → {last?.destination}
+                        {(b.itinerary?.length ?? 0) > 1 ? ' (return)' : ''}
+                        <div className="muted small">Flight · {first?.departureLocal.slice(0, 10)}</div>
+                      </>
+                    )}
                   </td>
                   <td>
                     {b.passengers[0].lastName}/{b.passengers[0].firstName}
@@ -86,7 +97,7 @@ export default function BookingsPage() {
                   </td>
                   <td>{b.pnr ?? '–'}</td>
                   <td>
-                    <span className={`status ${b.status}`}>{statusLabel(b.status)}</span>
+                    <span className={`status ${b.status}`}>{statusLabel(b.status, b.product)}</span>
                   </td>
                   <td style={{ textAlign: 'right' }}>{formatMoney(b.pricing.sell)}</td>
                 </tr>

@@ -1,13 +1,13 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { MockFlightSupplier } from '@tripwise/supplier-gateway';
+import { MockFlightSupplier, MockHotelSupplier } from '@tripwise/supplier-gateway';
 import { Pool } from 'pg';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { APP_CONFIG, loadConfig } from '../src/config';
 import { migrate } from '../src/db/migrate';
 import { seed, SEED_PASSWORD } from '../src/db/seed';
-import { FLIGHT_SUPPLIERS } from '../src/flights/supplier-registry';
+import { FLIGHT_SUPPLIERS, HOTEL_SUPPLIERS } from '../src/flights/supplier-registry';
 import { configureApp } from '../src/main';
 
 export const TEST_DATABASE_URL =
@@ -16,7 +16,7 @@ export const TEST_DATABASE_URL =
 /** Drops every Tripwise schema, migrates from scratch and seeds the standard world. */
 export async function resetDatabase(pool: Pool) {
   await pool.query(`
-    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify CASCADE;
+    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify, hotels CASCADE;
     DROP TABLE IF EXISTS public.schema_migration;`);
   await migrate(pool);
   await seed(pool);
@@ -37,6 +37,11 @@ export async function startApp() {
     )
     .overrideProvider(FLIGHT_SUPPLIERS)
     .useValue([new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] })])
+    .overrideProvider(HOTEL_SUPPLIERS)
+    .useValue([
+      new MockHotelSupplier({ variant: 'a', priceChangeCities: ['MBA'] }),
+      new MockHotelSupplier({ variant: 'b', priceChangeCities: ['MBA'] }),
+    ])
     .compile();
   const app = moduleRef.createNestApplication({ logger: false });
   configureApp(app, 'http://localhost:3000');
