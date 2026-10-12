@@ -1,9 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { CallContext, FlightSupplier, HotelSupplier, SupplierError, SupplierErrorCode } from '@tripwise/contracts';
+import { CallContext, FlightSupplier, HotelSupplier, InsuranceProvider, SupplierError, SupplierErrorCode } from '@tripwise/contracts';
 import { CircuitBreaker, withTimeout } from '@tripwise/supplier-gateway';
 
 export const FLIGHT_SUPPLIERS = Symbol('FLIGHT_SUPPLIERS');
 export const HOTEL_SUPPLIERS = Symbol('HOTEL_SUPPLIERS');
+export const INSURANCE_PROVIDERS = Symbol('INSURANCE_PROVIDERS');
 
 /**
  * A set of suppliers of one product, each behind its own circuit breaker. Every supplier call
@@ -43,5 +44,12 @@ export class SupplierRegistry extends SupplierPool<FlightSupplier> {
 export class HotelSupplierRegistry extends SupplierPool<HotelSupplier> {
   constructor(@Inject(HOTEL_SUPPLIERS) suppliers: HotelSupplier[]) {
     super(suppliers);
+  }
+}
+
+@Injectable()
+export class InsuranceProviderRegistry extends SupplierPool<InsuranceProvider> {
+  constructor(@Inject(INSURANCE_PROVIDERS) providers: InsuranceProvider[]) {
+    super(providers);
   }
 }

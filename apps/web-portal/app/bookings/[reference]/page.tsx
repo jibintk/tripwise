@@ -1,7 +1,8 @@
 'use client';
 
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Itinerary } from '@/components/Itinerary';
 import { notifyWalletChanged, Shell } from '@/components/Shell';
 import { api, ApiError, Booking, BOARD_LABEL, download } from '@/lib/api';
@@ -23,6 +24,15 @@ const EVENT_LABEL: Record<string, string> = {
   rejected: 'Not approved',
 };
 
+function eventLabel(type: string, product: Booking['product']): string {
+  if (product === 'insurance') {
+    if (type === 'confirmed') return 'Policy issued';
+    if (type === 'booking_failed') return 'Insurer declined the policy';
+    if (type === 'expired') return 'Quote expired';
+  }
+  return EVENT_LABEL[type] ?? type;
+}
+
 export default function BookingDetailPage() {
   const { reference } = useParams<{ reference: string }>();
   const [booking, setBooking] = useState<Booking | null>(null);
@@ -39,9 +49,11 @@ export default function BookingDetailPage() {
 
   async function act(kind: 'pay' | 'cancel') {
     const question =
-      booking?.product === 'hotel' && booking.status === 'confirmed'
-        ? 'Cancel this stay with the hotel? Any cancellation penalty is deducted from the refund.'
-        : 'Cancel this booking and release the hold?';
+      booking?.status !== 'confirmed'
+        ? 'Cancel this booking and release the hold?'
+        : booking.product === 'insurance'
+          ? 'Cancel this policy? Cover has not started, so the full premium is refunded.'
+          : 'Cancel this stay with the hotel? Any cancellation penalty is deducted from the refund.';
     if (kind === 'cancel' && !confirm(question)) return;
     setBusy(kind);
     setError(null);
@@ -68,7 +80,24 @@ export default function BookingDetailPage() {
 
   const expires = booking.holdExpiresAt ? new Date(booking.holdExpiresAt) : null;
   const isHotel = booking.product === 'hotel';
-  const docLabel = isHotel ? 'Download voucher (PDF)' : 'Download e-ticket (PDF)';
+  const isInsurance = booking.product === 'insurance';
+  const isFlight = booking.product === 'flight';
+  const doc = isInsurance
+    ? { label: 'Download certificate (PDF)', file: 'insurance' }
+    : isHotel
+      ? { label: 'Download voucher (PDF)', file: 'voucher' }
+      : { label: 'Download e-ticket (PDF)', file: 'eticket' };
+  const coverStarted = isInsurance && !!booking.cover && booking.cover.startDate <= new Date().toISOString().slice(0, 10);
+  const holdText = isInsurance
+    ? 'The premium is held until {t}. The policy is issued when you pay.'
+    : isHotel
+      ? 'The price is held until {t}. The room is reserved when you pay.'
+      : 'Seats are held until {t}. Pay before then or the airline releases them.';
+  const failedText = isInsurance
+    ? 'The insurer did not issue the policy'
+    : isHotel
+      ? 'The hotel supplier did not confirm the booking'
+      : 'The airline did not issue tickets';
 
   return (
     <Shell>
@@ -78,27 +107,30 @@ export default function BookingDetailPage() {
             {booking.reference} <span className={`status ${booking.status}`}>{statusLabel(booking.status, booking.product)}</span>
           </h1>
           <p className="muted small" style={{ margin: 0 }}>
-            {isHotel ? 'Supplier ref' : 'PNR'} {booking.pnr ?? '–'}
+            {isInsurance ? 'Policy' : isHotel ? 'Supplier ref' : 'PNR'} {booking.pnr ?? (isInsurance ? 'issued on payment' : '–')}
             {booking.hotelConfirmation ? ` · hotel confirmation ${booking.hotelConfirmation}` : ''} · created{' '}
             {new Date(booking.createdAt).toLocaleString()}
           </p>
         </div>
         {booking.status === 'confirmed' && (
           <div style={{ display: 'flex', gap: 8 }}>
-            {isHotel && (
+            {isFlight && (
+              <Link className="btn secondary" href={`/insurance?from=${booking.reference}`} style={{ display: 'inline-flex', alignItems: 'center' }}>
+                Add travel insurance
+              </Link>
+            )}
+            {(isHotel || (isInsurance && !coverStarted)) && (
               <button className="btn danger" onClick={() => act('cancel')} disabled={!!busy}>
-                {busy === 'cancel' ? 'Cancelling…' : 'Cancel stay'}
+                {busy === 'cancel' ? 'Cancelling…' : isInsurance ? 'Cancel policy' : 'Cancel stay'}
               </button>
             )}
             <button
               className="btn secondary"
               onClick={() =>
-                download(`/bookings/${booking.reference}/document.pdf`, `${isHotel ? 'voucher' : 'eticket'}-${booking.reference}.pdf`).catch((e) =>
-                  setError(e.message),
-                )
+                download(`/bookings/${booking.reference}/document.pdf`, `${doc.file}-${booking.reference}.pdf`).catch((e) => setError(e.message))
               }
             >
-              {docLabel}
+              {doc.label}
             </button>
           </div>
         )}
@@ -109,10 +141,12 @@ export default function BookingDetailPage() {
             </button>
             <button className="btn" onClick={() => act('pay')} disabled={!!busy}>
               {busy === 'pay'
-                ? isHotel
-                  ? 'Paying and booking…'
-                  : 'Paying and ticketing…'
-                : `Pay ${formatMoney(booking.pricing.agentCost)} and ${isHotel ? 'book' : 'ticket'}`}
+                ? isInsurance
+                  ? 'Paying and issuing…'
+                  : isHotel
+                    ? 'Paying and booking…'
+                    : 'Paying and ticketing…'
+                : `Pay ${formatMoney(booking.pricing.agentCost)} and ${isInsurance ? 'issue' : isHotel ? 'book' : 'ticket'}`}
             </button>
           </div>
         )}
@@ -125,14 +159,12 @@ export default function BookingDetailPage() {
       )}
       {booking.status === 'held' && expires && (
         <div className="alert warn" style={{ marginBottom: 16 }}>
-          {isHotel
-            ? `The price is held until ${expires.toLocaleString()}. The room is reserved when you pay.`
-            : `Seats are held until ${expires.toLocaleString()}. Pay before then or the airline releases them.`}
+          {holdText.replace('{t}', expires.toLocaleString())}
         </div>
       )}
       {booking.status === 'failed' && (
         <div className="alert bad" style={{ marginBottom: 16 }}>
-          {isHotel ? 'The hotel supplier did not confirm the booking' : 'The airline did not issue tickets'} ({booking.failureReason}). Your
+          {failedText} ({booking.failureReason}). Your
           wallet has been refunded in full and our operations team has been notified.
         </div>
       )}
@@ -154,14 +186,43 @@ export default function BookingDetailPage() {
       )}
       {booking.cancellation && (
         <div className="alert warn" style={{ marginBottom: 16 }}>
-          Cancelled. Hotel penalty {formatMoney(booking.cancellation.penalty)}; refunded to your wallet{' '}
+          {isInsurance ? 'Policy cancelled.' : `Cancelled. Hotel penalty ${formatMoney(booking.cancellation.penalty)};`} Refunded to your wallet{' '}
           {formatMoney(booking.cancellation.refunded)}.
         </div>
       )}
 
       <div className="two-col">
         <div className="stack">
-          {isHotel && booking.hotel && booking.stay && booking.room ? (
+          {isInsurance && booking.plan && booking.cover ? (
+            <div className="card">
+              <h2>{booking.plan.name}</h2>
+              <p className="muted small" style={{ marginTop: -8 }}>
+                {booking.plan.summary}
+              </p>
+              <dl className="kv" style={{ maxWidth: 560 }}>
+                <dt>Area</dt>
+                <dd>{booking.cover.regionLabel}</dd>
+                <dt>Cover</dt>
+                <dd>
+                  {booking.cover.startDate} to {booking.cover.endDate} ({booking.cover.days} days)
+                </dd>
+                {booking.linkedReference && (
+                  <>
+                    <dt>For trip</dt>
+                    <dd>
+                      <Link href={`/bookings/${booking.linkedReference}`}>{booking.linkedReference}</Link>
+                    </dd>
+                  </>
+                )}
+                {booking.plan.coverage.map((c) => (
+                  <Fragment key={c.label}>
+                    <dt>{c.label}</dt>
+                    <dd>{c.limit}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </div>
+          ) : isHotel && booking.hotel && booking.stay && booking.room ? (
             <div className="card">
               <h2>{booking.hotel.name}</h2>
               <p className="muted small" style={{ marginTop: -8 }}>
@@ -192,13 +253,13 @@ export default function BookingDetailPage() {
             </div>
           )}
           <div className="card">
-            <h2>{isHotel ? 'Guests' : 'Travellers'}</h2>
+            <h2>{isHotel ? 'Guests' : isInsurance ? 'Insured travellers' : 'Travellers'}</h2>
             <table>
               <thead>
                 <tr>
                   <th>Name</th>
                   {!isHotel && <th>Date of birth</th>}
-                  {!isHotel && <th>Ticket</th>}
+                  {isFlight && <th>Ticket</th>}
                   {isHotel && <th>Room</th>}
                 </tr>
               </thead>
@@ -209,7 +270,7 @@ export default function BookingDetailPage() {
                       {p.title} {p.firstName} {p.lastName}
                     </td>
                     {!isHotel && <td>{p.dateOfBirth}</td>}
-                    {!isHotel && <td>{booking.ticketNumbers[i] ?? '–'}</td>}
+                    {isFlight && <td>{booking.ticketNumbers[i] ?? '–'}</td>}
                     {isHotel && <td>Room {i + 1}</td>}
                   </tr>
                 ))}
@@ -261,7 +322,7 @@ export default function BookingDetailPage() {
             <ul style={{ margin: 0, paddingLeft: 18 }} className="small">
               {booking.events?.map((e, i) => (
                 <li key={i}>
-                  {EVENT_LABEL[e.type] ?? e.type} <span className="muted">· {new Date(e.at).toLocaleTimeString()}</span>
+                  {eventLabel(e.type, booking.product)} <span className="muted">· {new Date(e.at).toLocaleTimeString()}</span>
                 </li>
               ))}
             </ul>

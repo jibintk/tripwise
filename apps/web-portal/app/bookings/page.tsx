@@ -32,7 +32,7 @@ export default function BookingsPage() {
           <select id="status" value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">All</option>
             <option value="held">On hold</option>
-            <option value="confirmed">Ticketed</option>
+            <option value="confirmed">Confirmed</option>
             <option value="failed">Failed</option>
             <option value="cancelled">Cancelled</option>
             <option value="expired">Hold expired</option>
@@ -47,7 +47,7 @@ export default function BookingsPage() {
               <th>Reference</th>
               <th>Trip</th>
               <th>Lead guest / traveller</th>
-              <th>PNR</th>
+              <th>PNR / policy</th>
               <th>Status</th>
               <th style={{ textAlign: 'right' }}>Customer pays</th>
             </tr>
@@ -76,7 +76,14 @@ export default function BookingsPage() {
                     <Link href={`/bookings/${b.reference}`}>{b.reference}</Link>
                   </td>
                   <td>
-                    {b.product === 'hotel' ? (
+                    {b.product === 'insurance' ? (
+                      <>
+                        {b.plan?.name}
+                        <div className="muted small">
+                          Insurance · {b.cover?.startDate} to {b.cover?.endDate}
+                        </div>
+                      </>
+                    ) : b.product === 'hotel' ? (
                       <>
                         {b.hotel?.name}
                         <div className="muted small">

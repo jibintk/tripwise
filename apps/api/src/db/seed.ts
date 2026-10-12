@@ -114,6 +114,113 @@ export async function seed(pool: Pool): Promise<void> {
     await rule('tripwise', 'Operator hotel markup', 'percent', 800, { product: 'hotel' }); // 8%
     await rule('kenya_gsa', 'GSA hotel markup', 'percent', 200, { product: 'hotel' }); // 2%
 
+    await rule('tripwise', 'Operator insurance commission', 'percent', 1_000, { product: 'insurance' }); // 10%
+    await rule('kenya_gsa', 'GSA insurance commission', 'percent', 200, { product: 'insurance' }); // 2%
+
+    // Travel insurance plans (net rates per traveller, USD cents, by trip length).
+    const plans = [
+      {
+        code: 'essential',
+        name: 'Essential East Africa',
+        regions: ['east_africa'],
+        summary: 'Medical cover for regional trips within Kenya, Tanzania, Uganda, Rwanda and Burundi.',
+        coverage: [
+          { label: 'Emergency medical', limit: 'USD 50,000' },
+          { label: 'Medical evacuation', limit: 'USD 100,000' },
+          { label: 'Trip cancellation', limit: 'USD 1,000' },
+          { label: 'Baggage', limit: 'USD 500' },
+        ],
+        rates: [
+          { maxDays: 8, amount: 1_200 },
+          { maxDays: 15, amount: 1_800 },
+          { maxDays: 31, amount: 2_800 },
+          { maxDays: 62, amount: 4_500 },
+          { maxDays: 92, amount: 6_000 },
+        ],
+        maxAge: 75,
+        sort: 1,
+      },
+      {
+        code: 'africa_plus',
+        name: 'Africa Plus',
+        regions: ['east_africa', 'africa'],
+        summary: 'Higher medical limits and trip protection anywhere in Africa, including safaris.',
+        coverage: [
+          { label: 'Emergency medical', limit: 'USD 150,000' },
+          { label: 'Medical evacuation (incl. air ambulance)', limit: 'USD 250,000' },
+          { label: 'Trip cancellation', limit: 'USD 3,000' },
+          { label: 'Missed connection', limit: 'USD 500' },
+          { label: 'Baggage', limit: 'USD 1,000' },
+        ],
+        rates: [
+          { maxDays: 8, amount: 2_200 },
+          { maxDays: 15, amount: 3_200 },
+          { maxDays: 31, amount: 4_800 },
+          { maxDays: 62, amount: 7_500 },
+          { maxDays: 92, amount: 9_800 },
+          { maxDays: 180, amount: 15_000 },
+        ],
+        maxAge: 80,
+        sort: 2,
+      },
+      {
+        code: 'worldwide',
+        name: 'Worldwide Premier',
+        regions: ['east_africa', 'africa', 'worldwide'],
+        summary: 'Comprehensive cover worldwide, including the Schengen visa minimum of EUR 30,000 medical.',
+        coverage: [
+          { label: 'Emergency medical', limit: 'USD 500,000' },
+          { label: 'Medical evacuation and repatriation', limit: 'Unlimited' },
+          { label: 'Trip cancellation', limit: 'USD 5,000' },
+          { label: 'Travel delay', limit: 'USD 600' },
+          { label: 'Baggage', limit: 'USD 2,000' },
+          { label: 'Personal liability', limit: 'USD 1,000,000' },
+        ],
+        rates: [
+          { maxDays: 8, amount: 3_900 },
+          { maxDays: 15, amount: 5_600 },
+          { maxDays: 31, amount: 8_200 },
+          { maxDays: 62, amount: 13_000 },
+          { maxDays: 92, amount: 17_500 },
+          { maxDays: 180, amount: 28_000 },
+        ],
+        maxAge: 85,
+        sort: 3,
+      },
+    ];
+    for (const p of plans) {
+      await client.query(
+        `INSERT INTO insurance.plan (code, name, provider, regions, summary, coverage, rates, currency, max_age, sort)
+         VALUES ($1, $2, 'mockinsure', $3, $4, $5, $6, 'USD', $7, $8)`,
+        [p.code, p.name, p.regions, p.summary, JSON.stringify(p.coverage), JSON.stringify(p.rates), p.maxAge, p.sort],
+      );
+    }
+
+    // Own inventory, dated from today: blocked seats to Zanzibar four days a week, and a Saturday Mara charter.
+    const day = (offset: number) => new Date(Date.now() + offset * 86_400_000);
+    const series: [string, string, string, string, string, string, number, number, number, number, number, string][] = [];
+    for (let i = 1; i <= 90; i++) {
+      const d = day(i);
+      const date = d.toISOString().slice(0, 10);
+      if ([0, 1, 3, 5].includes(d.getUTCDay())) {
+        series.push(['blocked', 'KQ', '480', 'NBO', 'ZNZ', `${date} 07:40`, 85, 20, 9_000, 4_500, 10, `${date} 09:05`]);
+        series.push(['blocked', 'KQ', '481', 'ZNZ', 'NBO', `${date} 10:00`, 85, 20, 9_000, 4_500, 10, `${date} 11:25`]);
+      }
+      if (d.getUTCDay() === 6) {
+        series.push(['charter', 'XK', '701', 'NBO', 'MRE', `${date} 10:00`, 45, 12, 18_000, 1_500, 3, `${date} 10:45`]);
+        series.push(['charter', 'XK', '702', 'MRE', 'NBO', `${date} 15:00`, 45, 12, 18_000, 1_500, 3, `${date} 15:45`]);
+      }
+    }
+    for (const [kind, carrier, fn, from, to, dep, mins, seats, base, tax, releaseDays, arr] of series) {
+      await client.query(
+        `INSERT INTO inventory.allotment (owner_tenant_id, kind, carrier, flight_number, origin, destination, departure_local, arrival_local,
+           duration_min, cabin, fare_brand, checked_pieces, cabin_kg, base_amount, tax_amount, currency, seats_total, release_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $14::timestamp, $8, 'ECONOMY', $9, $10, 7, $11, $12, 'USD', $13,
+                 ($7::timestamp - make_interval(days => $15)) AT TIME ZONE 'UTC')`,
+        [ids.tripwise, kind, carrier, fn, from, to, dep, mins, kind === 'charter' ? 'Charter' : 'Group', 1, base, tax, seats, arr, releaseDays],
+      );
+    }
+
     // Corporate travel policy: staff fly economy under USD 800 booked a week ahead; executives may fly business.
     await client.query(
       `INSERT INTO policy.travel_policy (corporate_id, grade, rules, approval_mode) VALUES

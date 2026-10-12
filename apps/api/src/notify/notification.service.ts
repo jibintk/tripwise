@@ -41,7 +41,11 @@ export class NotificationService {
     if (event.type === 'booking.held' && b.channel === 'b2e') return;
     let route: string;
     let departure: string;
-    if (b.product === 'hotel') {
+    if (b.product === 'insurance') {
+      const s = b.offer_snapshot;
+      route = `${s.plan.name} travel insurance`;
+      departure = `cover ${s.request.startDate} to ${s.request.endDate}`;
+    } else if (b.product === 'hotel') {
       const s = b.offer_snapshot;
       route = `${s.hotel.name}, ${s.hotel.city}`;
       departure = `check-in ${s.request.checkIn}, check-out ${s.request.checkOut}`;

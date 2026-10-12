@@ -23,6 +23,7 @@ const can = (u: SessionUser, ...roles: string[]) => roles.some((r) => u.roles.in
 const NAV: NavItem[] = [
   { href: '/search', label: 'Flights', show: (u) => can(u, 'agent', 'traveller') || isOperator(u) },
   { href: '/hotels', label: 'Hotels', show: (u) => can(u, 'agent', 'traveller') || isOperator(u) },
+  { href: '/insurance', label: 'Insurance', show: (u) => can(u, 'agent', 'traveller') || isOperator(u) },
   { href: '/bookings', label: (u) => (isCorporate(u) ? 'Trips' : 'Bookings'), show: () => true },
   { href: '/approvals', label: 'Approvals', show: (u) => isCorporate(u) && can(u, 'approver', 'admin') },
   { href: '/corporate/policies', label: 'Travel policy', show: (u) => isCorporate(u) && can(u, 'admin') },
@@ -32,6 +33,7 @@ const NAV: NavItem[] = [
   { href: '/admin/agencies', label: 'Agencies', show: (u) => can(u, 'admin') && !['branch', 'corporate'].includes(u.tenant.type) },
   { href: '/admin/pricing', label: 'Pricing', show: (u) => can(u, 'admin') && !isCorporate(u) },
   { href: '/admin/wallets', label: 'Wallets', show: (u) => can(u, 'finance', 'admin') && isOperator(u) },
+  { href: '/admin/inventory', label: 'Inventory', show: (u) => can(u, 'ops', 'admin') && isOperator(u) },
   { href: '/admin/ops', label: 'Ops queue', show: (u) => can(u, 'ops', 'admin') && isOperator(u) },
 ];
 

@@ -4,6 +4,8 @@ import {
   HotelGuest,
   HotelRate,
   HotelSearchRequest,
+  InsuredTraveller,
+  InsuranceRegion,
   money,
   Passenger,
   SupplierError,
@@ -16,6 +18,7 @@ import { AuthUser, hasRole } from '../auth/auth.types';
 import { AppError, badRequest, conflict, forbidden, notFound } from '../common/errors';
 import { DbService } from '../db/db.service';
 import { renderETicket } from '../documents/eticket';
+import { renderInsuranceCertificate } from '../documents/insurance-certificate';
 import { renderHotelVoucher } from '../documents/voucher';
 import { OutboxService } from '../events/outbox.service';
 import { channelFor, FlightSearchService } from '../flights/flight-search.service';
@@ -23,7 +26,8 @@ import { CorporateService, TravellerContext } from '../corporate/corporate.servi
 import { Cabin, needsApproval, PolicyVerdict } from '../corporate/policy-engine';
 import { approvalRequested } from '../notify/templates';
 import { APP_CONFIG, AppConfig } from '../config';
-import { HotelSupplierRegistry, SupplierRegistry } from '../flights/supplier-registry';
+import { HotelSupplierRegistry, InsuranceProviderRegistry, SupplierRegistry } from '../flights/supplier-registry';
+import { coverDays, InsuranceService, premiumFor, REGION_LABEL } from '../insurance/insurance.service';
 import { HotelSearchService } from '../hotels/hotel-search.service';
 import { LedgerService } from '../payments/ledger.service';
 import { PriceQuote } from '../pricing/pricing-engine';
@@ -52,6 +56,23 @@ export interface CreateHotelBookingInput extends CorporateExtras {
   expectedSellAmount?: number;
 }
 
+export interface CreateInsuranceBookingInput {
+  quoteId: string;
+  travellers: InsuredTraveller[];
+  contact: { email: string; phone: string };
+  expectedSellAmount?: number;
+  /** The flight or hotel booking this cover is for, if any. */
+  linkedReference?: string;
+}
+
+export interface InsuranceSnapshot {
+  kind: 'insurance';
+  plan: { code: string; name: string; summary: string; coverage: { label: string; limit: string }[] };
+  request: { region: InsuranceRegion; startDate: string; endDate: string };
+  days: number;
+  linkedReference?: string;
+}
+
 export interface HotelSnapshot {
   kind: 'hotel';
   hotel: { id: string; name: string; city: string; address: string; stars: number };
@@ -60,7 +81,7 @@ export interface HotelSnapshot {
   specialRequests?: string;
 }
 
-type Product = 'flight' | 'hotel';
+type Product = 'flight' | 'hotel' | 'insurance';
 
 export interface BookingRow {
   id: string;
@@ -110,6 +131,10 @@ const RETURNING = `RETURNING *, tenant_path::text AS tenant_path`;
 const TICKET_ATTEMPTS = 2;
 /** Hotels have no supplier-side hold; the checked price is honoured for this long. */
 const HOTEL_PRICE_LOCK_MINUTES = 20;
+/** Insurance quotes are honoured for this long once the travellers are entered. */
+const INSURANCE_PRICE_LOCK_MINUTES = 30;
+/** Shown on certificates; the insurer's assistance line. */
+const ASSISTANCE_LINE = '+254 20 000 0000 (24 hours, collect calls accepted)';
 
 /** Booking history entries that other modules (notifications, reporting) hear about. */
 const PUBLIC_EVENTS: Record<string, string> = {
@@ -146,6 +171,8 @@ export class BookingService {
     private readonly tenancy: TenancyService,
     private readonly outbox: OutboxService,
     private readonly corporate: CorporateService,
+    private readonly insurance: InsuranceService,
+    private readonly insurers: InsuranceProviderRegistry,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -237,6 +264,53 @@ export class BookingService {
       quote,
       pnr: null,
       holdExpiresAt: new Date(Date.now() + HOTEL_PRICE_LOCK_MINUTES * 60_000).toISOString(),
+    });
+  }
+
+  /**
+   * Holds an insurance quote for the named travellers. Nothing is reserved with the insurer; the
+   * premium is re-checked against the current plan rates and the policy is issued on payment.
+   */
+  async createInsurance(user: AuthUser, input: CreateInsuranceBookingInput, idempotencyKey: string | undefined, traceId: string) {
+    const existing = await this.existing(user, idempotencyKey);
+    if (existing) return this.view(user, existing);
+    const quote = await this.insurance.getQuote(input.quoteId);
+    const quoted = quote.request.travellers.map((t) => t.dateOfBirth).sort();
+    const named = input.travellers.map((t) => t.dateOfBirth).sort();
+    if (quoted.length !== named.length || quoted.some((d, i) => d !== named[i])) {
+      throw badRequest('Travellers must match the quote: same number of people and the same dates of birth');
+    }
+    if (input.linkedReference) await this.getRow(user, input.linkedReference);
+
+    const plan = await this.insurance.plan(quote.planCode);
+    const premium = premiumFor(plan, quote.request);
+    if ('unavailable' in premium) throw conflict('OFFER_EXPIRED', `This plan no longer fits the trip: ${premium.unavailable}`);
+    const pricer = await this.pricing.pricerFor(user.tenantPath);
+    const priced = pricer(money(premium.net, plan.currency), this.insurance.pricingContext(plan, channelFor(user)));
+    this.checkExpectedPrice(input.expectedSellAmount, priced);
+
+    const traveller = await this.corporate.travellerContext(user);
+    const policy = traveller
+      ? await this.corporatePolicy(traveller, { inPolicy: true, violations: [] }, {}, priced.sell.amount, undefined)
+      : null;
+    const { region, startDate, endDate } = quote.request;
+    const snapshot: InsuranceSnapshot = {
+      kind: 'insurance',
+      plan: { code: plan.code, name: plan.name, summary: plan.summary, coverage: plan.coverage },
+      request: { region, startDate, endDate },
+      days: coverDays(startDate, endDate),
+      linkedReference: input.linkedReference?.toUpperCase(),
+    };
+    return this.insertHeld(user, idempotencyKey!, traceId, {
+      policy,
+      product: 'insurance',
+      supplier: plan.provider,
+      snapshot,
+      passengers: input.travellers,
+      contact: input.contact,
+      quote: priced,
+      pnr: null,
+      holdExpiresAt: new Date(Date.now() + INSURANCE_PRICE_LOCK_MINUTES * 60_000).toISOString(),
     });
   }
 
@@ -377,6 +451,15 @@ export class BookingService {
   private async reHold(b: BookingRow, traceId: string) {
     const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000 };
     const pricer = await this.pricing.pricerFor(b.tenant_path);
+    if (b.product === 'insurance') {
+      const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+      const plan = await this.insurance.plan(s.plan.code);
+      const premium = premiumFor(plan, { ...s.request, travellers: b.passengers as InsuredTraveller[] });
+      if ('unavailable' in premium) return 'price_changed' as const;
+      const q = pricer(money(premium.net, plan.currency), this.insurance.pricingContext(plan, 'b2e'));
+      if (q.sell.amount !== b.sell_amount) return 'price_changed' as const;
+      return { pnr: null, holdExpiresAt: new Date(Date.now() + INSURANCE_PRICE_LOCK_MINUTES * 60_000).toISOString() };
+    }
     if (b.product === 'hotel') {
       const s = b.offer_snapshot as HotelSnapshot;
       const rate = await this.hotelRegistry.call(b.supplier, ctx, (sup) => sup.checkRate(s.rate, s.request, ctx));
@@ -421,6 +504,10 @@ export class BookingService {
   }
 
   private tripSummary(b: BookingRow): string {
+    if (b.product === 'insurance') {
+      const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+      return `${s.plan.name}, ${REGION_LABEL[s.request.region]}, ${s.request.startDate} to ${s.request.endDate}`;
+    }
     if (b.product === 'hotel') {
       const s = b.offer_snapshot as HotelSnapshot;
       return `${s.hotel.name}, ${s.hotel.city}, ${s.request.checkIn} to ${s.request.checkOut}`;
@@ -431,7 +518,38 @@ export class BookingService {
   }
 
   private fulfil(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
+    if (b.product === 'insurance') return this.issuePolicy(b, operatorId, traceId);
     return b.product === 'hotel' ? this.bookHotel(b, operatorId, traceId) : this.ticketFlight(b, operatorId, traceId);
+  }
+
+  /** Issues the policy. One attempt, keyed by our reference, so a retry never creates a second policy. */
+  private async issuePolicy(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
+    const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000, idempotencyKey: `issue:${b.reference}` };
+    try {
+      const issued = await this.insurers.call(b.supplier, ctx, (p) =>
+        p.issue(
+          {
+            planCode: s.plan.code,
+            region: s.request.region,
+            startDate: s.request.startDate,
+            endDate: s.request.endDate,
+            travellers: b.passengers as InsuredTraveller[],
+            premium: money(b.net_amount, b.currency),
+            reference: b.reference,
+          },
+          ctx,
+        ),
+      );
+      return this.succeed(b, { pnr: issued.policyNumber, fulfilment: { policyNumber: issued.policyNumber } }, 'confirmed', {
+        policyNumber: issued.policyNumber,
+        traceId,
+      });
+    } catch (err) {
+      this.logger.warn({ traceId, booking: b.reference }, `Policy issue failed: ${(err as Error).message}`);
+      const reason = err instanceof SupplierError ? err.code : SupplierErrorCode.BOOKING_FAILED;
+      return this.failAndRefund(b, operatorId, reason, 'booking_failed', traceId);
+    }
   }
 
   private async ticketFlight(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
@@ -519,6 +637,7 @@ export class BookingService {
     const b = await this.getRow(user, reference);
     if (b.status === 'cancelled') return this.view(user, b);
     if (b.status === 'confirmed' && b.product === 'hotel') return this.view(user, await this.cancelConfirmedHotel(user, b, traceId));
+    if (b.status === 'confirmed' && b.product === 'insurance') return this.view(user, await this.cancelPolicy(user, b, traceId));
     if (b.status !== 'held') {
       throw conflict(
         'INVALID_STATE',
@@ -563,6 +682,30 @@ export class BookingService {
     });
   }
 
+  /** Cancels a policy before cover starts, with a full refund of what the agency paid. */
+  private async cancelPolicy(user: AuthUser, b: BookingRow, traceId: string): Promise<BookingRow> {
+    if (b.tenant_id !== user.tenantId && !hasRole(user, 'ops')) throw forbidden('Only the booking agency can cancel this policy');
+    const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+    if (new Date().toISOString().slice(0, 10) >= s.request.startDate) {
+      throw conflict('COVER_STARTED', 'Cover has started, so the policy can no longer be cancelled online. Contact the insurer for a claim or refund.');
+    }
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000 };
+    const result = await this.insurers.call(b.supplier, ctx, (p) => p.cancel(b.pnr!, ctx));
+    if (!result.cancelled) throw conflict('CANCEL_REJECTED', 'The insurer did not accept the cancellation');
+    const operatorId = await this.operatorIdFor(b.tenant_path);
+    return this.db.tx(async (client) => {
+      await this.ledger.refundBooking(client, b.tenant_id, operatorId, money(b.agent_cost_amount, b.currency), b.reference);
+      const cancellation = { penalty: money(0, b.currency), refunded: money(b.agent_cost_amount, b.currency) };
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'cancelled', fulfilment = fulfilment || $2::jsonb, updated_at = now() WHERE id = $1 ${RETURNING}`,
+        [b.id, JSON.stringify({ cancellation })],
+      );
+      await this.event(client, b, 'cancelled', { traceId, by: user.id, ...cancellation });
+      await this.event(client, b, 'refunded', { amount: b.agent_cost_amount, currency: b.currency });
+      return rows[0];
+    });
+  }
+
   /** Gives back whatever the supplier is holding for an unpaid booking. Hotels hold nothing. */
   private async release(b: BookingRow, traceId: string) {
     if (b.product !== 'flight' || !b.pnr) return;
@@ -598,6 +741,24 @@ export class BookingService {
     if (b.status !== 'confirmed') throw conflict('INVALID_STATE', 'Documents are available once the booking is confirmed');
     const issuer = await this.tenancy.get(b.tenant_id);
     const total = `${b.currency} ${(b.sell_amount / 100).toFixed(2)}`;
+    if (b.product === 'insurance') {
+      const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+      const pdf = await renderInsuranceCertificate({
+        reference: b.reference,
+        issuedBy: issuer.name,
+        policyNumber: b.pnr ?? '',
+        planName: s.plan.name,
+        region: REGION_LABEL[s.request.region],
+        startDate: s.request.startDate,
+        endDate: s.request.endDate,
+        days: s.days,
+        travellers: b.passengers as InsuredTraveller[],
+        coverage: s.plan.coverage,
+        total,
+        emergencyContact: ASSISTANCE_LINE,
+      });
+      return { filename: `insurance-${b.reference}.pdf`, pdf };
+    }
     if (b.product === 'hotel') {
       const s = b.offer_snapshot as HotelSnapshot;
       const pdf = await renderHotelVoucher({
@@ -851,6 +1012,18 @@ export class BookingService {
       createdAt: b.created_at,
       updatedAt: b.updated_at,
     };
+    if (b.product === 'insurance') {
+      const s = b.offer_snapshot as unknown as InsuranceSnapshot;
+      return {
+        ...common,
+        ticketNumbers: [],
+        plan: s.plan,
+        cover: { ...s.request, regionLabel: REGION_LABEL[s.request.region], days: s.days },
+        policyNumber: (b.fulfilment.policyNumber as string) ?? null,
+        linkedReference: s.linkedReference ?? null,
+        cancellation: b.fulfilment.cancellation ?? null,
+      };
+    }
     if (b.product === 'hotel') {
       const s = b.offer_snapshot as HotelSnapshot;
       return {

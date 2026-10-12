@@ -8,7 +8,7 @@ export interface Rendered {
 
 interface BookingView {
   reference: string;
-  product: 'flight' | 'hotel';
+  product: 'flight' | 'hotel' | 'insurance';
   pnr: string | null;
   passengers: { title: string; firstName: string; lastName: string }[];
   ticketNumbers: string[];
@@ -33,6 +33,7 @@ function names(b: BookingView) {
 
 export function bookingConfirmed(b: BookingView): Rendered {
   if (b.product === 'hotel') return hotelConfirmed(b);
+  if (b.product === 'insurance') return policyIssued(b);
   const tickets = b.passengers.map((p, i) => `${p.firstName} ${p.lastName}: ${b.ticketNumbers[i] ?? '-'}`);
   const subject = `Your e-ticket ${b.reference} · ${b.route}`;
   const text = [
@@ -75,7 +76,24 @@ function hotelConfirmed(b: BookingView): Rendered {
   return { subject, text, html };
 }
 
+function policyIssued(b: BookingView): Rendered {
+  const subject = `Your travel insurance ${b.pnr} · ${b.reference}`;
+  const lines = [
+    `${b.route} is issued: policy number ${b.pnr}.`,
+    `Period: ${b.departure}`,
+    `Insured: ${names(b)}`,
+    `Total paid: ${b.sell}`,
+    'Download the certificate from your booking and carry it while travelling. It can be cancelled for a full refund until cover starts.',
+  ];
+  return { subject, text: lines.join('\n'), html: wrap('Your travel insurance is issued', lines.map(esc)) };
+}
+
 export function bookingHeld(b: BookingView): Rendered {
+  if (b.product === 'insurance') {
+    const subject = `Insurance quote held ${b.reference} · pay before ${b.holdExpiresAt}`;
+    const text = `The premium for ${b.route} (${b.departure}) is held for ${names(b)} until ${b.holdExpiresAt}. The policy is issued once payment is made.`;
+    return { subject, text, html: wrap('Quote held', [esc(text)]) };
+  }
   if (b.product === 'hotel') {
     const subject = `Price held ${b.reference} · pay before ${b.holdExpiresAt}`;
     const text = `The price for ${b.route} (${b.departure}) is held for ${names(b)} until ${b.holdExpiresAt}. The room is reserved once payment is made.`;
@@ -87,10 +105,10 @@ export function bookingHeld(b: BookingView): Rendered {
 }
 
 export function bookingFailed(b: BookingView): Rendered {
-  const what = b.product === 'hotel' ? 'The hotel supplier did not confirm' : 'The airline did not issue tickets for';
-  const subject = `Action needed: ${b.product === 'hotel' ? 'booking' : 'ticketing'} failed for ${b.reference}`;
+  const what = { hotel: 'The hotel supplier did not confirm', insurance: 'The insurer did not issue', flight: 'The airline did not issue tickets for' }[b.product];
+  const subject = `Action needed: ${b.product === 'flight' ? 'ticketing' : 'booking'} failed for ${b.reference}`;
   const text = `${what} ${b.reference} (${b.route}), reason ${b.failureReason}. The full amount was refunded to the agency wallet. Operations has been notified.`;
-  return { subject, text, html: wrap('Ticketing failed, refunded', [esc(text)]) };
+  return { subject, text, html: wrap(b.product === 'flight' ? 'Ticketing failed, refunded' : 'Booking failed, refunded', [esc(text)]) };
 }
 
 export function bookingExpired(b: BookingView): Rendered {
@@ -101,7 +119,7 @@ export function bookingExpired(b: BookingView): Rendered {
 
 export function bookingCancelled(b: BookingView): Rendered {
   const subject = `Booking cancelled ${b.reference}`;
-  const released = b.product === 'hotel' ? 'the reservation was released' : 'the seats were released';
+  const released = { hotel: 'the reservation was released', insurance: 'the policy was cancelled', flight: 'the seats were released' }[b.product];
   const text = `Booking ${b.reference} (${b.route}) was cancelled and ${released}.`;
   return { subject, text, html: wrap('Booking cancelled', [esc(text)]) };
 }

@@ -8,6 +8,7 @@ import { APP_CONFIG, loadConfig } from '../src/config';
 import { migrate } from '../src/db/migrate';
 import { seed, SEED_PASSWORD } from '../src/db/seed';
 import { FLIGHT_SUPPLIERS, HOTEL_SUPPLIERS } from '../src/flights/supplier-registry';
+import { OwnInventorySupplier } from '../src/inventory/own-inventory.supplier';
 import { configureApp } from '../src/main';
 
 export const TEST_DATABASE_URL =
@@ -16,7 +17,7 @@ export const TEST_DATABASE_URL =
 /** Drops every Tripwise schema, migrates from scratch and seeds the standard world. */
 export async function resetDatabase(pool: Pool) {
   await pool.query(`
-    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify, hotels, policy CASCADE;
+    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify, hotels, policy, inventory, insurance CASCADE;
     DROP TABLE IF EXISTS public.schema_migration;`);
   await migrate(pool);
   await seed(pool);
@@ -35,8 +36,12 @@ export async function startApp() {
         JOBS_ENABLED: 'false',
       }),
     )
+    // Own inventory is real code on the test database; only third-party suppliers are mocked.
     .overrideProvider(FLIGHT_SUPPLIERS)
-    .useValue([new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] })])
+    .useFactory({
+      factory: (own: OwnInventorySupplier) => [new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] }), own],
+      inject: [OwnInventorySupplier],
+    })
     .overrideProvider(HOTEL_SUPPLIERS)
     .useValue([
       new MockHotelSupplier({ variant: 'a', priceChangeCities: ['MBA'] }),

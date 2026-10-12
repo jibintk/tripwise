@@ -3,12 +3,14 @@ import { BookingService } from '../bookings/booking.service';
 import { APP_CONFIG, AppConfig } from '../config';
 import { OutboxService } from '../events/outbox.service';
 import { NotificationService } from '../notify/notification.service';
+import { OwnInventorySupplier } from '../inventory/own-inventory.supplier';
 
 export interface JobRunResult {
   eventsDelivered: number;
   notificationsProcessed: number;
   holdsExpired: string[];
   ticketingRecovered: string[];
+  seatHoldsReleased: string[];
 }
 
 /**
@@ -26,6 +28,7 @@ export class JobsService implements OnApplicationBootstrap, OnApplicationShutdow
     private readonly outbox: OutboxService,
     private readonly notifications: NotificationService,
     private readonly bookings: BookingService,
+    private readonly inventory: OwnInventorySupplier,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -45,7 +48,7 @@ export class JobsService implements OnApplicationBootstrap, OnApplicationShutdow
     this.running = true;
     try {
       const r = await this.runAll();
-      if (r.eventsDelivered || r.holdsExpired.length || r.ticketingRecovered.length) this.logger.log(JSON.stringify(r));
+      if (r.eventsDelivered || r.holdsExpired.length || r.ticketingRecovered.length || r.seatHoldsReleased.length) this.logger.log(JSON.stringify(r));
     } catch (err) {
       this.logger.error(`Job run failed: ${(err as Error).message}`);
     } finally {
@@ -60,6 +63,7 @@ export class JobsService implements OnApplicationBootstrap, OnApplicationShutdow
     let eventsDelivered = 0;
     for (let n = await this.outbox.dispatch(); n > 0; n = await this.outbox.dispatch()) eventsDelivered += n;
     const notificationsProcessed = await this.notifications.sendPending();
-    return { eventsDelivered, notificationsProcessed, holdsExpired, ticketingRecovered };
+    const seatHoldsReleased = await this.inventory.releaseStaleHolds();
+    return { eventsDelivered, notificationsProcessed, holdsExpired, ticketingRecovered, seatHoldsReleased };
   }
 }

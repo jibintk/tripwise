@@ -127,7 +127,7 @@ export interface Passenger {
 
 export interface Booking {
   reference: string;
-  product: 'flight' | 'hotel';
+  product: 'flight' | 'hotel' | 'insurance';
   status: string;
   supplier?: string;
   pnr: string | null;
@@ -143,6 +143,11 @@ export interface Booking {
   stay?: { checkIn: string; checkOut: string; nights: number; rooms: { adults: number; childAges?: number[] }[] };
   room?: { name: string; board: string; refundable: boolean; freeCancellationUntil?: string };
   hotelConfirmation?: string | null;
+  /** insurance */
+  plan?: { code: string; name: string; summary: string; coverage: { label: string; limit: string }[] };
+  cover?: { region: InsuranceRegion; regionLabel: string; startDate: string; endDate: string; days: number };
+  policyNumber?: string | null;
+  linkedReference?: string | null;
   cancellation?: { penalty: Money; refunded: Money } | null;
   specialRequests?: string;
   channel?: string;
@@ -348,3 +353,69 @@ export const APPROVAL_MODE_LABEL: Record<ApprovalMode, string> = {
   out_of_policy: 'Only out-of-policy trips need approval',
   never: 'No approval (out-of-policy trips are reported)',
 };
+
+// ---- travel insurance ----
+
+export type InsuranceRegion = 'east_africa' | 'africa' | 'worldwide';
+
+export const REGION_LABEL: Record<InsuranceRegion, string> = {
+  east_africa: 'East Africa',
+  africa: 'Africa',
+  worldwide: 'Worldwide',
+};
+
+export interface InsuranceQuote {
+  quoteId: string | null;
+  plan: { code: string; name: string; summary: string; coverage: { label: string; limit: string }[] };
+  unavailable?: string;
+  pricing?: { agentCost: Money; sell: Money; yourMarkup: Money };
+}
+
+export interface QuoteResult {
+  region: InsuranceRegion;
+  startDate: string;
+  endDate: string;
+  days: number;
+  travellers: number;
+  quotes: InsuranceQuote[];
+}
+
+// ---- own flight inventory ----
+
+export interface Allotment {
+  id: string;
+  kind: 'blocked' | 'charter' | 'a2a';
+  carrier: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  departureLocal: string;
+  arrivalLocal: string;
+  durationMin: number;
+  cabin: string;
+  fareBrand: string | null;
+  checkedPieces: number;
+  refundable: boolean;
+  baseAmount: number;
+  taxAmount: number;
+  currency: string;
+  seatsTotal: number;
+  seatsHeld: number;
+  seatsSold: number;
+  seatsAvailable: number;
+  releaseAt: string;
+  status: 'active' | 'closed' | 'released';
+  notes: string | null;
+}
+
+export interface ManifestPassenger {
+  pnr: string;
+  status: 'held' | 'ticketed';
+  type: string;
+  title: string;
+  firstName: string;
+  lastName: string;
+  dateOfBirth: string;
+  documentNumber: string | null;
+  ticketNumber: string | null;
+}

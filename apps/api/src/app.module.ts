@@ -1,7 +1,7 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
-import { MockFlightSupplier, MockHotelSupplier } from '@tripwise/supplier-gateway';
+import { MockFlightSupplier, MockHotelSupplier, MockInsuranceProvider } from '@tripwise/supplier-gateway';
 import { AuthController } from './auth/auth.controller';
 import { AuthGuard } from './auth/auth.guard';
 import { AuthService } from './auth/auth.service';
@@ -14,7 +14,19 @@ import { APP_CONFIG, AppConfig, loadConfig } from './config';
 import { DbService } from './db/db.service';
 import { FlightSearchService } from './flights/flight-search.service';
 import { FlightsController } from './flights/flights.controller';
-import { FLIGHT_SUPPLIERS, HOTEL_SUPPLIERS, HotelSupplierRegistry, SupplierRegistry } from './flights/supplier-registry';
+import {
+  FLIGHT_SUPPLIERS,
+  HOTEL_SUPPLIERS,
+  HotelSupplierRegistry,
+  INSURANCE_PROVIDERS,
+  InsuranceProviderRegistry,
+  SupplierRegistry,
+} from './flights/supplier-registry';
+import { InsuranceController } from './insurance/insurance.controller';
+import { InsuranceService } from './insurance/insurance.service';
+import { InventoryController } from './inventory/inventory.controller';
+import { InventoryService } from './inventory/inventory.service';
+import { OwnInventorySupplier } from './inventory/own-inventory.supplier';
 import { HotelContentService } from './hotels/hotel-content.service';
 import { HotelSearchService } from './hotels/hotel-search.service';
 import { HotelsController } from './hotels/hotels.controller';
@@ -57,11 +69,18 @@ import { TenancyService } from './tenancy/tenancy.service';
     HotelsController,
     CorporateController,
     ApprovalsController,
+    InventoryController,
+    InsuranceController,
   ],
   providers: [
     { provide: APP_CONFIG, useFactory: () => loadConfig() },
-    // Real adapters (Amadeus, an NDC aggregator, own inventory) are added here as they are certified.
-    { provide: FLIGHT_SUPPLIERS, useFactory: () => [new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] })] },
+    // Real adapters (Amadeus, an NDC aggregator) are added here as they are certified. Own inventory is always on.
+    {
+      provide: FLIGHT_SUPPLIERS,
+      inject: [OwnInventorySupplier],
+      useFactory: (own: OwnInventorySupplier) => [new MockFlightSupplier({ priceChangeRoutes: ['NBO-MBA'] }), own],
+    },
+    { provide: INSURANCE_PROVIDERS, useFactory: () => [new MockInsuranceProvider()] },
     // Two mock hotel suppliers that overlap, so content mapping and best-rate selection are exercised.
     {
       provide: HOTEL_SUPPLIERS,
@@ -89,6 +108,10 @@ import { TenancyService } from './tenancy/tenancy.service';
     JobsService,
     CorporateService,
     ApprovalService,
+    OwnInventorySupplier,
+    InventoryService,
+    InsuranceProviderRegistry,
+    InsuranceService,
   ],
 })
 export class AppModule implements NestModule {

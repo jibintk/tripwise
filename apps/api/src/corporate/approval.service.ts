@@ -116,6 +116,7 @@ export class ApprovalService {
 }
 
 function summarise(product: string, s: any): string {
+  if (product === 'insurance') return `${s.plan.name}, ${s.request.startDate} to ${s.request.endDate}`;
   if (product === 'hotel') return `${s.hotel.name}, ${s.request.checkIn} to ${s.request.checkOut}`;
   const first = s.slices[0].segments[0];
   const last = s.slices[0].segments[s.slices[0].segments.length - 1];

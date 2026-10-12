@@ -29,8 +29,8 @@ const CreateBody = z.object({
 });
 
 const ListQuery = z.object({
-  status: z.enum(['held', 'paid', 'ticketing', 'confirmed', 'cancelled', 'failed', 'expired']).optional(),
-  product: z.enum(['flight', 'hotel']).optional(),
+  status: z.enum(['held', 'pending_approval', 'rejected', 'paid', 'ticketing', 'confirmed', 'cancelled', 'failed', 'expired']).optional(),
+  product: z.enum(['flight', 'hotel', 'insurance']).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
@@ -59,7 +59,7 @@ export class BookingsController {
   }
 
   /** E-ticket for flights, voucher for hotels. Both paths serve the same document. */
-  @Get([':reference/eticket.pdf', ':reference/voucher.pdf', ':reference/document.pdf'])
+  @Get([':reference/eticket.pdf', ':reference/voucher.pdf', ':reference/certificate.pdf', ':reference/document.pdf'])
   async document(@CurrentUser() user: AuthUser, @Param('reference') reference: string, @Res() res: Response) {
     const { filename, pdf } = await this.bookings.document(user, reference);
     res.setHeader('content-type', 'application/pdf');

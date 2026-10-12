@@ -22,6 +22,8 @@ The first vertical slice: an agency searches flights, books, pays from its walle
 - **E-ticket PDF** download for ticketed bookings.
 - **Back office**: agencies tree (create, suspend with immediate lock-out), users with one-time passwords, markup rules, wallets with top-ups and credit lines (operator finance), and an operations queue for failed or stuck bookings.
 - **Corporate travel (B2E)**: travel policies per employee grade (cabin, fare cap, booking window, refundable fares, hotel stars and nightly cap). Search results are marked in or out of policy and the lowest fare is highlighted. Out-of-policy trips need a reason and, depending on the policy, go to the employee's approver, who decides in the portal or with a one-click link in the email (single-use, 48 hours). Approved trips are paid from the company account and ticketed straight away; if the price changed while waiting, nothing is booked. Travel managers set policies, grades, cost centres and approvers, and see spend, compliance and missed savings per traveller.
+- **Own flight inventory**: the operator loads blocked seats, charters and airline (A2A) contracts as dated series with a net fare, capacity and a release date. They are sold through the normal flight search and booking flow next to GDS content, with the usual markups, one-way or return. Seat counts change under a row lock, so the last seat can never be sold twice; unpaid holds are released by the expiry job, and ticketing issues the operator's own ticket numbers. The back office shows load per flight, lets the operator change fares and capacity or close a flight, and exports the passenger manifest (CSV) for name submission to the airline.
+- **Travel insurance**: plans agreed with insurers (coverage, net rates by trip length, age limits and senior loading) are quoted for a trip, priced through the markup chain, held, paid and issued by the insurer, with a certificate PDF. Insurance can be added from a ticketed flight (dates, travellers and area of cover are filled in) and cancelled for a full refund until cover starts.
 - **B2B partner portal** (Next.js): sign in, search flights and hotels, enter travellers or guests, hold, pay and ticket or book, download e-tickets and vouchers, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
 
 ## Repository layout
@@ -77,6 +79,8 @@ Seeded users (password `Password123!`):
 
 Safari Desk starts with USD 5,000 plus a USD 1,000 credit line; Coastways with USD 500; Acme Kenya has a USD 20,000 company account.
 
+Own inventory is seeded on NBO–ZNZ (KQ480/481, four days a week) and a Saturday Masai Mara charter (NBO–MRE, XK701/702); search those routes to see it next to the mock supplier. Flights inside their release window show as released.
+
 To see an approval, sign in as staff@acme.dev, search a business-class flight, give a reason and send it. Without `SMTP_URL` the approval email (with its one-click link) is printed in the API log; or sign in as approver@acme.dev and open Approvals.
 
 ### Try the flow with curl
@@ -97,7 +101,7 @@ curl -s -X POST localhost:4000/api/v1/bookings/<reference>/payments -H "authoriz
 
 ### Mock supplier test hooks
 
-The mock hotel suppliers use the lead guest's last name the same way: `SOLDOUT` and `BOOKFAIL`; hotels in `MBA` change price at the price check. The mock flight supplier simulates failures from the passenger's last name: `SOLDOUT` (hold fails), `BADDATA` (passenger rejected), `TICKETFAIL` (ticketing fails after payment, which triggers the automatic refund). Searches to `MBA` change price at reprice, to exercise `PRICE_CHANGED`.
+The mock hotel suppliers use the lead guest's last name the same way: `SOLDOUT` and `BOOKFAIL`; hotels in `MBA` change price at the price check. The mock flight supplier simulates failures from the passenger's last name: `SOLDOUT` (hold fails), `BADDATA` (passenger rejected), `TICKETFAIL` (ticketing fails after payment, which triggers the automatic refund). Searches to `MBA` change price at reprice, to exercise `PRICE_CHANGED`. The mock insurer declines any policy with a traveller named `POLICYFAIL`.
 
 ## Tests
 
@@ -142,13 +146,19 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 | GET | /api/v1/approvals | Trips waiting for the signed-in approver |
 | POST | /api/v1/approvals/{id}/decision | Approve or reject in the portal |
 | GET / POST | /api/v1/approvals/{id}/by-token | One-click decision from the email link (no login) |
+| GET / POST | /api/v1/inventory/allotments | List own-inventory flights / load a series (operator) |
+| PATCH | /api/v1/inventory/allotments/{id} | Change fare, capacity, release date or close (operator) |
+| GET | /api/v1/inventory/allotments/{id}/manifest[.csv] | Passenger manifest (operator) |
+| GET | /api/v1/insurance/plans | Insurance plans (net rates for the operator only) |
+| PUT | /api/v1/insurance/plans/{code}/active | Withdraw or reinstate a plan (operator admin) |
+| POST | /api/v1/insurance/quotes | Price every plan for a trip |
+| POST | /api/v1/insurance/bookings | Hold a quote for named travellers (Idempotency-Key required) |
 | GET | /health | Liveness |
 
 ## Next steps
 
 Following the delivery plan, Phase 1:
 
-1. Own flight inventory (A2A, charters, blocked seats) and travel insurance.
-2. Holiday packages and visa services.
-3. B2C website, front-office desk (POS) and the AI agent.
-4. First real flight adapter once the supplier is chosen; Keycloak; Kafka in place of the in-process event bus.
+1. Holiday packages and visa services.
+2. B2C website, front-office desk (POS) and the AI agent.
+3. First real flight adapter once the supplier is chosen; Keycloak; Kafka in place of the in-process event bus.
