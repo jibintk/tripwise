@@ -141,6 +141,60 @@ export interface Wallet {
   currency: string;
 }
 
+/** Downloads an authenticated file (for example an e-ticket PDF) and hands it to the browser. */
+export async function download(path: string, filename: string): Promise<void> {
+  const res = await fetch(`${API_URL}${path}`, { headers: { authorization: `Bearer ${session.token()}` } });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, body.code ?? 'HTTP_ERROR', body.detail ?? res.statusText, body);
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export interface Tenant {
+  id: string;
+  type: string;
+  parentId: string | null;
+  code: string;
+  path: string;
+  name: string;
+  country: string;
+  currency: string;
+  status: string;
+}
+
+export interface WalletRow {
+  tenantId: string;
+  name: string;
+  type: string;
+  path: string;
+  status: string;
+  currency: string;
+  balance: number;
+  creditLimit: number;
+  available: number;
+}
+
+export interface PricingRule {
+  id: string;
+  name: string;
+  product: string | null;
+  channel: string | null;
+  supplier: string | null;
+  origin: string | null;
+  destination: string | null;
+  cabin: string | null;
+  valueType: 'percent' | 'fixed';
+  value: number;
+  currency: string | null;
+  priority: number;
+}
+
 export function newIdempotencyKey(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()

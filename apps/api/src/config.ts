@@ -8,6 +8,17 @@ const schema = z.object({
   SEARCH_SUPPLIER_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
   SEARCH_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   CORS_ORIGINS: z.string().default('http://localhost:3000'),
+  /** e.g. smtp://localhost:1025 for Mailpit. Without it, emails are logged instead of sent. */
+  SMTP_URL: z.string().optional(),
+  MAIL_FROM: z.string().default('Tripwise <no-reply@tripwise.dev>'),
+  /** Background jobs (outbox, emails, hold expiry, ticketing recovery). Off in tests, which run them directly. */
+  JOBS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  JOBS_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  /** How long a paid booking may sit in `ticketing` before the recovery job retries it. */
+  STUCK_TICKETING_SECONDS: z.coerce.number().int().positive().default(300),
 });
 
 export type AppConfig = z.infer<typeof schema>;

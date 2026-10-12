@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import { AuthUser, hasRole } from '../auth/auth.types';
+import { randomBytes } from 'crypto';
+import { AuthUser, hasRole, Role } from '../auth/auth.types';
+import { hashPassword } from '../auth/password';
 import { conflict, forbidden, notFound } from '../common/errors';
 import { DbService } from '../db/db.service';
 
@@ -58,6 +60,62 @@ export class TenancyService {
   /** True if `tenantPath` is the caller's tenant or below it. */
   inScope(user: AuthUser, tenantPath: string): boolean {
     return tenantPath === user.tenantPath || tenantPath.startsWith(`${user.tenantPath}.`);
+  }
+
+  /** Suspend or reactivate a tenant below the caller. Suspended tenants cannot log in. */
+  async setStatus(user: AuthUser, id: string, status: 'active' | 'suspended'): Promise<Tenant> {
+    if (!hasRole(user, 'admin')) throw forbidden('Only admins can change agency status');
+    const t = await this.get(id);
+    if (!this.inScope(user, t.path)) throw notFound('Tenant');
+    if (t.id === user.tenantId) throw conflict('INVALID_TARGET', 'You cannot change the status of your own organisation');
+    const updated = await this.db.one<Tenant>(`UPDATE tenancy.tenant SET status = $2 WHERE id = $1 RETURNING ${COLUMNS}`, [id, status]);
+    await this.db.query(
+      `INSERT INTO audit.audit_log (actor_id, tenant_id, action, entity, entity_id, data) VALUES ($1,$2,$3,'tenant',$4,'{}')`,
+      [user.id, user.tenantId, `tenant.${status}`, id],
+    );
+    return updated!;
+  }
+
+  async listUsers(user: AuthUser, tenantId: string) {
+    if (!hasRole(user, 'admin')) throw forbidden('Only admins can view users');
+    const t = await this.get(tenantId);
+    if (!this.inScope(user, t.path)) throw notFound('Tenant');
+    const { rows } = await this.db.query(
+      `SELECT id, email, name, roles, status, created_at AS "createdAt" FROM tenancy.app_user WHERE tenant_id = $1 ORDER BY name`,
+      [tenantId],
+    );
+    return rows;
+  }
+
+  /**
+   * Creates a user with a one-time password returned once in the response.
+   * Admins can grant only roles they hold themselves; finance and ops exist only at the operator.
+   */
+  async createUser(user: AuthUser, tenantId: string, input: { email: string; name: string; roles: Role[] }) {
+    if (!hasRole(user, 'admin')) throw forbidden('Only admins can create users');
+    const t = await this.get(tenantId);
+    if (!this.inScope(user, t.path)) throw notFound('Tenant');
+    const notHeld = input.roles.filter((r) => r !== 'agent' && !user.roles.includes(r));
+    if (notHeld.length) throw forbidden(`You cannot grant roles you do not hold: ${notHeld.join(', ')}`);
+    if (t.type !== 'operator' && input.roles.some((r) => r === 'finance' || r === 'ops')) {
+      throw conflict('INVALID_ROLE', 'Finance and ops roles exist only at the operator');
+    }
+    const temporaryPassword = randomBytes(9).toString('base64url');
+    try {
+      const created = await this.db.one(
+        `INSERT INTO tenancy.app_user (tenant_id, email, name, password_hash, roles) VALUES ($1, lower($2), $3, $4, $5)
+         RETURNING id, email, name, roles, status`,
+        [tenantId, input.email, input.name, await hashPassword(temporaryPassword), input.roles],
+      );
+      await this.db.query(
+        `INSERT INTO audit.audit_log (actor_id, tenant_id, action, entity, entity_id, data) VALUES ($1,$2,'user.created','user',$3,$4)`,
+        [user.id, user.tenantId, created.id, JSON.stringify({ email: input.email, roles: input.roles, tenantId })],
+      );
+      return { ...created, temporaryPassword };
+    } catch (err) {
+      if ((err as { code?: string }).code === '23505') throw conflict('EMAIL_TAKEN', 'A user with this email already exists');
+      throw err;
+    }
   }
 
   async createChild(

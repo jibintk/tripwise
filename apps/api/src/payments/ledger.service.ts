@@ -57,6 +57,40 @@ export class LedgerService {
     return { account, entries: rows };
   }
 
+  /** Every wallet in the caller's subtree with live balances. Admins and finance only. */
+  async listWallets(user: AuthUser) {
+    if (!hasRole(user, 'admin', 'finance')) throw forbidden('Only admins and finance can view wallets');
+    const { rows } = await this.db.query(
+      `SELECT t.id AS "tenantId", t.name, t.type, t.path::text AS path, t.status, a.currency, a.credit_limit AS "creditLimit",
+              COALESCE((SELECT SUM(amount) FROM payments.ledger_entry e WHERE e.account_id = a.id), 0)::bigint AS balance
+         FROM payments.account a JOIN tenancy.tenant t ON t.id = a.tenant_id
+        WHERE a.type = 'wallet' AND t.path <@ $1::ltree AND t.id <> $2
+        ORDER BY t.path`,
+      [user.tenantPath, user.tenantId],
+    );
+    return rows.map((r) => ({ ...r, available: Number(r.balance) + Number(r.creditLimit) }));
+  }
+
+  /** Credit lines are an operator finance decision. */
+  async setCreditLimit(user: AuthUser, tenantId: string, currency: string, creditLimit: number) {
+    if (user.tenantType !== 'operator' || !hasRole(user, 'finance')) {
+      throw forbidden('Only operator finance users can change credit limits');
+    }
+    const tenant = await this.tenancy.get(tenantId);
+    if (!this.tenancy.inScope(user, tenant.path)) throw notFound('Tenant');
+    const res = await this.db.query(
+      `UPDATE payments.account SET credit_limit = $3 WHERE tenant_id = $1 AND type = 'wallet' AND currency = $2`,
+      [tenantId, currency, creditLimit],
+    );
+    if (!res.rowCount) throw notFound(`${currency} wallet`);
+    await this.db.query(
+      `INSERT INTO audit.audit_log (actor_id, tenant_id, action, entity, entity_id, data)
+       VALUES ($1, $2, 'wallet.credit_limit_changed', 'tenant', $3, $4)`,
+      [user.id, user.tenantId, tenantId, JSON.stringify({ currency, creditLimit })],
+    );
+    return this.summary(tenantId, currency);
+  }
+
   /** Operator finance credits a wallet in its subtree from the operator funding account. */
   async topup(user: AuthUser, tenantId: string, amount: Money, memo: string) {
     if (user.tenantType !== 'operator' || !hasRole(user, 'finance')) {

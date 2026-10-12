@@ -16,6 +16,10 @@ import { FlightSearchService } from './flights/flight-search.service';
 import { FlightsController } from './flights/flights.controller';
 import { FLIGHT_SUPPLIERS, SupplierRegistry } from './flights/supplier-registry';
 import { HealthController } from './health.controller';
+import { OpsController } from './bookings/ops.controller';
+import { OutboxService } from './events/outbox.service';
+import { JobsService } from './jobs/jobs.service';
+import { NotificationService } from './notify/notification.service';
 import { AccountsController } from './payments/accounts.controller';
 import { LedgerService } from './payments/ledger.service';
 import { PricingController } from './pricing/pricing.controller';
@@ -43,6 +47,7 @@ import { TenancyService } from './tenancy/tenancy.service';
     AccountsController,
     FlightsController,
     BookingsController,
+    OpsController,
   ],
   providers: [
     { provide: APP_CONFIG, useFactory: () => loadConfig() },
@@ -59,6 +64,9 @@ import { TenancyService } from './tenancy/tenancy.service';
     SupplierRegistry,
     FlightSearchService,
     BookingService,
+    OutboxService,
+    NotificationService,
+    JobsService,
   ],
 })
 export class AppModule implements NestModule {

@@ -35,6 +35,7 @@ const STATUS_LABEL: Record<string, string> = {
   confirmed: 'Ticketed',
   cancelled: 'Cancelled',
   failed: 'Failed, refunded',
+  expired: 'Hold expired',
 };
 
 export function statusLabel(status: string): string {

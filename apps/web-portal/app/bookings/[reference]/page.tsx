@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import { Itinerary } from '@/components/Itinerary';
 import { notifyWalletChanged, Shell } from '@/components/Shell';
-import { api, ApiError, Booking } from '@/lib/api';
+import { api, ApiError, Booking, download } from '@/lib/api';
 import { formatMoney, statusLabel } from '@/lib/format';
 
 const EVENT_LABEL: Record<string, string> = {
@@ -14,6 +14,8 @@ const EVENT_LABEL: Record<string, string> = {
   ticketing_failed: 'Ticketing failed',
   refunded: 'Refunded to wallet',
   cancelled: 'Cancelled',
+  expired: 'Hold expired, seats released',
+  ops_resolved: 'Resolved by operations',
 };
 
 export default function BookingDetailPage() {
@@ -68,6 +70,14 @@ export default function BookingDetailPage() {
             PNR {booking.pnr ?? '–'} · created {new Date(booking.createdAt).toLocaleString()}
           </p>
         </div>
+        {booking.status === 'confirmed' && (
+          <button
+            className="btn secondary"
+            onClick={() => download(`/bookings/${booking.reference}/eticket.pdf`, `eticket-${booking.reference}.pdf`).catch((e) => setError(e.message))}
+          >
+            Download e-ticket (PDF)
+          </button>
+        )}
         {booking.status === 'held' && (
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="btn danger" onClick={() => act('cancel')} disabled={!!busy}>

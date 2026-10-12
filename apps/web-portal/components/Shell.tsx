@@ -10,10 +10,23 @@ import { formatMoney } from '@/lib/format';
 export const WALLET_CHANGED = 'tripwise:wallet-changed';
 export const notifyWalletChanged = () => window.dispatchEvent(new Event(WALLET_CHANGED));
 
-const NAV = [
-  { href: '/search', label: 'Search flights' },
-  { href: '/bookings', label: 'Bookings' },
-  { href: '/wallet', label: 'Wallet' },
+interface NavItem {
+  href: string;
+  label: string;
+  show: (u: SessionUser) => boolean;
+}
+
+const isOperator = (u: SessionUser) => u.tenant.type === 'operator';
+const can = (u: SessionUser, ...roles: string[]) => roles.some((r) => u.roles.includes(r));
+
+const NAV: NavItem[] = [
+  { href: '/search', label: 'Search flights', show: (u) => can(u, 'agent') || isOperator(u) },
+  { href: '/bookings', label: 'Bookings', show: () => true },
+  { href: '/wallet', label: 'Wallet', show: (u) => !isOperator(u) },
+  { href: '/admin/agencies', label: 'Agencies', show: (u) => can(u, 'admin') && u.tenant.type !== 'branch' },
+  { href: '/admin/pricing', label: 'Pricing', show: (u) => can(u, 'admin') },
+  { href: '/admin/wallets', label: 'Wallets', show: (u) => can(u, 'finance', 'admin') && isOperator(u) },
+  { href: '/admin/ops', label: 'Ops queue', show: (u) => can(u, 'ops', 'admin') && isOperator(u) },
 ];
 
 /** Signed-in frame: top bar, navigation, wallet balance. Redirects to /login without a session. */
@@ -30,7 +43,9 @@ export function Shell({ children }: { children: React.ReactNode }) {
       return;
     }
     setUser(u);
-    const refresh = () => api<Wallet>('/accounts/me').then(setWallet).catch(() => setWallet(null));
+    // The operator has no wallet of its own; it sees all wallets under Wallets.
+    const refresh = () =>
+      isOperator(u) ? Promise.resolve() : api<Wallet>('/accounts/me').then(setWallet).catch(() => setWallet(null));
     refresh();
     window.addEventListener(WALLET_CHANGED, refresh);
     return () => window.removeEventListener(WALLET_CHANGED, refresh);
@@ -45,13 +60,13 @@ export function Shell({ children }: { children: React.ReactNode }) {
           Trip<span>wise</span>
         </Link>
         <nav className="nav">
-          {NAV.map((n) => (
+          {NAV.filter((n) => n.show(user)).map((n) => (
             <Link key={n.href} href={n.href} className={path?.startsWith(n.href) ? 'active' : ''}>
               {n.label}
             </Link>
           ))}
         </nav>
-        {wallet && (
+        {wallet && !isOperator(user) && (
           <span className="wallet-pill" title="Balance plus credit line">
             Available {formatMoney({ amount: wallet.available, currency: wallet.currency })}
           </span>

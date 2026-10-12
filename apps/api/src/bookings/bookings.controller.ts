@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
+import { Response } from 'express';
 import { z } from 'zod';
 import { CurrentUser, TraceId } from '../auth/auth.decorators';
 import { AuthUser } from '../auth/auth.types';
@@ -24,7 +25,7 @@ const CreateBody = z.object({
 });
 
 const ListQuery = z.object({
-  status: z.enum(['held', 'paid', 'ticketing', 'confirmed', 'cancelled', 'failed']).optional(),
+  status: z.enum(['held', 'paid', 'ticketing', 'confirmed', 'cancelled', 'failed', 'expired']).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
@@ -50,6 +51,14 @@ export class BookingsController {
   @Get(':reference')
   get(@CurrentUser() user: AuthUser, @Param('reference') reference: string) {
     return this.bookings.get(user, reference);
+  }
+
+  @Get(':reference/eticket.pdf')
+  async eticket(@CurrentUser() user: AuthUser, @Param('reference') reference: string, @Res() res: Response) {
+    const { filename, pdf } = await this.bookings.eticket(user, reference);
+    res.setHeader('content-type', 'application/pdf');
+    res.setHeader('content-disposition', `attachment; filename="${filename}"`);
+    res.send(pdf);
   }
 
   @Post(':reference/payments')

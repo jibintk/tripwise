@@ -3,8 +3,10 @@ import { FlightOffer, money, Passenger, SupplierError, SupplierErrorCode } from 
 import { randomBytes } from 'crypto';
 import { PoolClient } from 'pg';
 import { AuthUser, hasRole } from '../auth/auth.types';
-import { AppError, badRequest, conflict, notFound } from '../common/errors';
+import { AppError, badRequest, conflict, forbidden, notFound } from '../common/errors';
 import { DbService } from '../db/db.service';
+import { renderETicket } from '../documents/eticket';
+import { OutboxService } from '../events/outbox.service';
 import { FlightSearchService } from '../flights/flight-search.service';
 import { SupplierRegistry } from '../flights/supplier-registry';
 import { LedgerService } from '../payments/ledger.service';
@@ -39,12 +41,24 @@ interface BookingRow {
   hold_expires_at: Date | null;
   ticket_numbers: string[];
   failure_reason: string | null;
+  ops_resolved_at: Date | null;
+  ops_note: string | null;
   created_at: Date;
   updated_at: Date;
 }
 
 const SELECT = `SELECT *, tenant_path::text AS tenant_path FROM booking.booking`;
 const TICKET_ATTEMPTS = 2;
+
+/** Booking history entries that other modules (notifications, reporting) hear about. */
+const PUBLIC_EVENTS: Record<string, string> = {
+  held: 'booking.held',
+  paid: 'booking.paid',
+  ticketed: 'booking.confirmed',
+  ticketing_failed: 'booking.failed',
+  cancelled: 'booking.cancelled',
+  expired: 'booking.expired',
+};
 
 /**
  * Flight booking saga: reprice -> hold -> pay -> ticket -> confirm.
@@ -62,6 +76,7 @@ export class BookingService {
     private readonly pricing: PricingService,
     private readonly ledger: LedgerService,
     private readonly tenancy: TenancyService,
+    private readonly outbox: OutboxService,
   ) {}
 
   async create(user: AuthUser, input: CreateBookingInput, idempotencyKey: string | undefined, traceId: string) {
@@ -116,7 +131,7 @@ export class BookingService {
             idempotencyKey,
           ],
         );
-        await this.event(client, rows[0].id, 'held', { pnr: hold.pnr, traceId, by: user.id });
+        await this.event(client, rows[0], 'held', { pnr: hold.pnr, traceId, by: user.id });
         return rows[0];
       });
       return this.view(user, row);
@@ -149,7 +164,7 @@ export class BookingService {
         `UPDATE booking.booking SET status = 'ticketing', updated_at = now() WHERE id = $1 RETURNING *, tenant_path::text AS tenant_path`,
         [b.id],
       );
-      await this.event(client, b.id, 'paid', { amount: b.agent_cost_amount, currency: b.currency, traceId, by: user.id });
+      await this.event(client, b, 'paid', { amount: b.agent_cost_amount, currency: b.currency, traceId, by: user.id });
       return { booking: rows[0], charged: true };
     });
 
@@ -174,7 +189,7 @@ export class BookingService {
          RETURNING *, tenant_path::text AS tenant_path`,
         [b.id],
       );
-      if (rows[0]) await this.event(client, b.id, 'cancelled', { traceId, by: user.id });
+      if (rows[0]) await this.event(client, b, 'cancelled', { traceId, by: user.id });
       return rows[0] ?? b;
     });
     return this.view(user, row);
@@ -197,6 +212,109 @@ export class BookingService {
     return { ...this.view(user, b), events };
   }
 
+  /** PDF e-ticket receipt, available once the booking is ticketed. */
+  async eticket(user: AuthUser, reference: string): Promise<{ filename: string; pdf: Buffer }> {
+    const b = await this.getRow(user, reference);
+    if (b.status !== 'confirmed') throw conflict('INVALID_STATE', 'E-tickets are available once the booking is ticketed');
+    const issuer = await this.tenancy.get(b.tenant_id);
+    const bag = b.offer_snapshot.baggage?.[0];
+    const pdf = await renderETicket({
+      reference: b.reference,
+      pnr: b.pnr ?? '',
+      issuedBy: issuer.name,
+      passengers: b.passengers,
+      ticketNumbers: b.ticket_numbers,
+      slices: b.offer_snapshot.slices,
+      fareBrand: b.offer_snapshot.fareBrand,
+      baggage: bag ? `${bag.checkedPieces} checked piece(s), ${bag.cabinKg} kg cabin` : undefined,
+      total: `${b.currency} ${(b.sell_amount / 100).toFixed(2)}`,
+    });
+    return { filename: `eticket-${b.reference}.pdf`, pdf };
+  }
+
+  // ---------- background jobs ----------
+
+  /**
+   * Marks holds past their time limit as expired and releases the seats with the supplier.
+   * Rows are claimed by the UPDATE itself, so concurrent runners never expire one booking twice.
+   */
+  async expireHolds(batch = 100): Promise<string[]> {
+    const expired = await this.db.tx(async (client) => {
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'expired', updated_at = now()
+          WHERE id IN (SELECT id FROM booking.booking WHERE status = 'held' AND hold_expires_at < now()
+                        ORDER BY hold_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED)
+          RETURNING *, tenant_path::text AS tenant_path`,
+        [batch],
+      );
+      for (const b of rows) await this.event(client, b, 'expired', { holdExpiresAt: b.hold_expires_at });
+      return rows;
+    });
+    for (const b of expired) {
+      const ctx = { traceId: 'job:expire-holds', tenantId: b.tenant_id, timeoutMs: 15_000 };
+      await this.registry.call(b.supplier, ctx, (s) => s.cancel({ supplier: b.supplier, pnr: b.pnr! }, ctx)).catch((err) =>
+        this.logger.warn(`Could not release expired hold ${b.reference}: ${(err as Error).message}`),
+      );
+    }
+    return expired.map((b) => b.reference);
+  }
+
+  /**
+   * Finishes bookings that were paid but never reached confirmed or failed, for example because
+   * the process died mid-ticketing. Supplier ticketing is idempotent per PNR, and the refund is
+   * idempotent per booking, so retrying is safe.
+   */
+  async recoverStuckTicketing(olderThanSeconds = 300, batch = 20): Promise<string[]> {
+    const { rows } = await this.db.query<BookingRow>(
+      `UPDATE booking.booking SET updated_at = now()
+        WHERE id IN (SELECT id FROM booking.booking WHERE status = 'ticketing'
+                      AND updated_at < now() - make_interval(secs => $1) LIMIT $2 FOR UPDATE SKIP LOCKED)
+        RETURNING *, tenant_path::text AS tenant_path`,
+      [olderThanSeconds, batch],
+    );
+    const done: string[] = [];
+    for (const b of rows) {
+      const result = await this.ticket(b, await this.operatorIdFor(b.tenant_path), 'job:recover-ticketing');
+      done.push(`${b.reference}:${result.status}`);
+    }
+    return done;
+  }
+
+  // ---------- operations ----------
+
+  /** Bookings that need a person: failed and not yet resolved, or stuck in ticketing. */
+  async opsQueue(user: AuthUser) {
+    if (!hasRole(user, 'ops', 'admin')) throw forbidden('Operations access required');
+    const { rows } = await this.db.query<BookingRow>(
+      `${SELECT} WHERE tenant_path <@ $1::ltree
+         AND ((status = 'failed' AND ops_resolved_at IS NULL)
+           OR (status = 'ticketing' AND updated_at < now() - interval '10 minutes'))
+       ORDER BY updated_at`,
+      [user.tenantPath],
+    );
+    return rows.map((r) => ({ ...this.view(user, r), agencyPath: r.tenant_path }));
+  }
+
+  async resolveFailure(user: AuthUser, reference: string, note: string) {
+    if (!hasRole(user, 'ops', 'admin')) throw forbidden('Operations access required');
+    const b = await this.getRow(user, reference);
+    if (b.status !== 'failed') throw conflict('INVALID_STATE', 'Only failed bookings can be resolved');
+    const row = await this.db.tx(async (client) => {
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET ops_resolved_at = now(), ops_resolved_by = $2, ops_note = $3, updated_at = now()
+          WHERE id = $1 RETURNING *, tenant_path::text AS tenant_path`,
+        [b.id, user.id, note],
+      );
+      await this.event(client, b, 'ops_resolved', { note, by: user.id });
+      return rows[0];
+    });
+    return this.view(user, row);
+  }
+
+  private async operatorIdFor(tenantPath: string): Promise<string> {
+    return (await this.tenancy.ancestors(tenantPath))[0].id;
+  }
+
   private async ticket(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
     const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000, idempotencyKey: `ticket:${b.reference}` };
     const ref = { supplier: b.supplier, pnr: b.pnr!, holdExpiresAt: b.hold_expires_at?.toISOString() };
@@ -210,7 +328,7 @@ export class BookingService {
              RETURNING *, tenant_path::text AS tenant_path`,
             [b.id, result.ticketNumbers],
           );
-          await this.event(client, b.id, 'ticketed', { ticketNumbers: result.ticketNumbers, attempt, traceId });
+          await this.event(client, b, 'ticketed', { ticketNumbers: result.ticketNumbers, attempt, traceId });
           return rows[0];
         });
       } catch (err) {
@@ -232,8 +350,8 @@ export class BookingService {
          RETURNING *, tenant_path::text AS tenant_path`,
         [b.id, reason],
       );
-      await this.event(client, b.id, 'ticketing_failed', { reason, traceId });
-      await this.event(client, b.id, 'refunded', { amount: b.agent_cost_amount, currency: b.currency });
+      await this.event(client, b, 'ticketing_failed', { reason, traceId });
+      await this.event(client, b, 'refunded', { amount: b.agent_cost_amount, currency: b.currency });
       // Ops queue: failed bookings are listed for operations by status = 'failed'.
       return rows[0];
     });
@@ -265,12 +383,20 @@ export class BookingService {
     return b;
   }
 
-  private event(client: PoolClient, bookingId: string, type: string, data: Record<string, unknown>) {
-    return client.query(`INSERT INTO booking.booking_event (booking_id, type, data) VALUES ($1, $2, $3)`, [
-      bookingId,
+  /** Appends to the booking's own history and, for public state changes, to the outbox in the same transaction. */
+  private async event(
+    client: PoolClient,
+    b: Pick<BookingRow, 'id' | 'reference' | 'tenant_id'>,
+    type: string,
+    data: Record<string, unknown>,
+  ) {
+    await client.query(`INSERT INTO booking.booking_event (booking_id, type, data) VALUES ($1, $2, $3)`, [
+      b.id,
       type,
       JSON.stringify(data),
     ]);
+    const published = PUBLIC_EVENTS[type];
+    if (published) await this.outbox.add(client, published, 'booking', b.reference, b.tenant_id, { reference: b.reference, ...data });
   }
 
   private view(user: AuthUser, b: BookingRow) {
@@ -283,6 +409,7 @@ export class BookingService {
       holdExpiresAt: b.hold_expires_at,
       ticketNumbers: b.ticket_numbers,
       failureReason: b.failure_reason,
+      opsResolution: b.ops_resolved_at ? { at: b.ops_resolved_at, note: b.ops_note } : null,
       itinerary: b.offer_snapshot.slices,
       fareBrand: b.offer_snapshot.fareBrand,
       refundable: b.offer_snapshot.refundable,

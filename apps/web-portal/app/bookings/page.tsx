@@ -35,6 +35,7 @@ export default function BookingsPage() {
             <option value="confirmed">Ticketed</option>
             <option value="failed">Failed</option>
             <option value="cancelled">Cancelled</option>
+            <option value="expired">Hold expired</option>
           </select>
         </div>
       </div>

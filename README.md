@@ -16,6 +16,10 @@ The first vertical slice: an agency searches flights, books, pays from its walle
 - **Booking saga**: reprice → hold → pay → ticket → confirm, with every step logged as an event. Payment is idempotent and race-safe. A ticketing failure after payment is retried, then refunded automatically.
 - **Ledger**: double-entry, append-only. Wallet balance plus credit limit decides what an agency can spend. Operator finance tops up wallets.
 - **Errors**: every error is `application/problem+json` with a stable `code` and a `traceId`.
+- **Events and email**: every booking state change is written to a transactional outbox and delivered to subscribers; customers get emails for holds, tickets, expiries and failures (Mailpit catches them locally).
+- **Background jobs**: hold-expiry sweep (releases seats), recovery of bookings stuck in ticketing after a crash, outbox delivery and email sending. Safe to run on several API instances.
+- **E-ticket PDF** download for ticketed bookings.
+- **Back office**: agencies tree (create, suspend with immediate lock-out), users with one-time passwords, markup rules, wallets with top-ups and credit lines (operator finance), and an operations queue for failed or stuck bookings.
 - **B2B partner portal** (Next.js): sign in, search flights, enter travellers, hold, pay and ticket, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
 
 ## Repository layout
@@ -112,15 +116,23 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 | GET | /api/v1/bookings, /bookings/{ref} | List and view bookings in scope |
 | POST | /api/v1/bookings/{ref}/payments | Pay from wallet and ticket |
 | POST | /api/v1/bookings/{ref}/cancel | Cancel a held booking |
+| GET | /api/v1/bookings/{ref}/eticket.pdf | E-ticket receipt |
+| PATCH | /api/v1/tenants/{id} | Suspend or reactivate |
+| GET / POST | /api/v1/tenants/{id}/users | List / create users |
+| GET | /api/v1/accounts | Wallets in scope (admin, finance) |
+| PUT | /api/v1/accounts/{tenantId}/credit-limit | Set a credit line (operator finance) |
+| GET | /api/v1/ops/queue | Failed and stuck bookings |
+| POST | /api/v1/ops/bookings/{ref}/resolve | Record what operations did |
+| POST | /api/v1/ops/jobs/run | Run background jobs now (operator admin) |
 | GET | /health | Liveness |
 
 ## Next steps
 
 Following the delivery plan, Phase 1:
 
-1. Recovery job for bookings left in `ticketing` by a crash, and hold-expiry sweeps.
-2. Outbox table and Kafka events (`booking.confirmed`, ...), then e-ticket PDFs and email.
-3. First real flight adapter once the supplier is chosen, behind the same `FlightSupplier` interface.
-4. Back-office screens: agencies, pricing rules, wallet top-ups, failed-booking queue.
-5. Keycloak for login, Postgres row-level security as a second tenant guard.
-6. Hotel module and hotel content mapping.
+1. Hotels: supplier contract, search, room rates, booking and vouchers.
+2. Corporate travel (B2E): policies, approvals.
+3. Own flight inventory (A2A, charters, blocked seats) and travel insurance.
+4. Holiday packages and visa services.
+5. B2C website, front-office desk (POS) and the AI agent.
+6. First real flight adapter once the supplier is chosen; Keycloak; Kafka in place of the in-process event bus.

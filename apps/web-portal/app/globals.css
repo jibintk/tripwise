@@ -92,6 +92,7 @@ h2 { font-size: 17px; margin: 0 0 12px; font-weight: 600; }
 .status.held { background: var(--warn-soft); color: var(--warn); }
 .status.confirmed { background: var(--good-soft); color: var(--good); }
 .status.failed, .status.cancelled { background: var(--bad-soft); color: var(--bad); }
+.status.expired { background: var(--bg); color: var(--ink-3); border: 1px solid var(--line); }
 .status.paid, .status.ticketing { background: var(--brand-soft); color: var(--brand); }
 
 table { width: 100%; border-collapse: collapse; font-size: 14px; }

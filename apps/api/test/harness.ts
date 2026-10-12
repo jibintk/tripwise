@@ -16,7 +16,7 @@ export const TEST_DATABASE_URL =
 /** Drops every Tripwise schema, migrates from scratch and seeds the standard world. */
 export async function resetDatabase(pool: Pool) {
   await pool.query(`
-    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit CASCADE;
+    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify CASCADE;
     DROP TABLE IF EXISTS public.schema_migration;`);
   await migrate(pool);
   await seed(pool);
@@ -32,6 +32,7 @@ export async function startApp() {
         DATABASE_URL: TEST_DATABASE_URL,
         JWT_SECRET: 'test-secret-at-least-16-chars',
         SEARCH_SUPPLIER_TIMEOUT_MS: '2000',
+        JOBS_ENABLED: 'false',
       }),
     )
     .overrideProvider(FLIGHT_SUPPLIERS)
