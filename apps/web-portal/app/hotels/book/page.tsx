@@ -2,6 +2,7 @@
 
 import { useRouter } from 'next/navigation';
 import { FormEvent, useEffect, useRef, useState } from 'react';
+import { ExceptionReason } from '@/components/PolicyBadge';
 import { Shell } from '@/components/Shell';
 import { api, ApiError, Booking, BOARD_LABEL, HotelResult, HotelSearchRequest, newIdempotencyKey, RoomOffer } from '@/lib/api';
 import { formatMoney, Money } from '@/lib/format';
@@ -21,6 +22,7 @@ export default function HotelBookPage() {
   const [guests, setGuests] = useState<Guest[]>([]);
   const [contact, setContact] = useState({ email: '', phone: '' });
   const [requests, setRequests] = useState('');
+  const [reason, setReason] = useState('');
   const [expected, setExpected] = useState<Money | null>(null);
   const [priceChanged, setPriceChanged] = useState<Money | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +58,7 @@ export default function HotelBookPage() {
           contact,
           specialRequests: requests || undefined,
           expectedSellAmount: expected.amount,
+          reasonForException: sel.offer.policy && !sel.offer.policy.inPolicy ? reason : undefined,
         }),
       });
       sessionStorage.removeItem('tripwise.hotelOffer');
@@ -64,6 +67,8 @@ export default function HotelBookPage() {
       if (err instanceof ApiError && err.code === 'PRICE_CHANGED') {
         setPriceChanged({ amount: err.body.newSellAmount as number, currency: err.body.currency as string });
         key.current = newIdempotencyKey();
+      } else if (err instanceof ApiError && err.code === 'NO_APPROVER') {
+        setError(err.message);
       } else if (err instanceof ApiError && err.code === 'OFFER_EXPIRED') {
         setError('This room price has expired. Please search again.');
       } else if (err instanceof ApiError && Array.isArray(err.body.errors)) {
@@ -84,7 +89,10 @@ export default function HotelBookPage() {
         <div>
           <h1>Guest details</h1>
           <p className="muted small" style={{ margin: 0 }}>
-            One lead guest per room, as on their ID. The price is held for 20 minutes; the room is reserved when you pay.
+            One lead guest per room, as on their ID.{' '}
+            {sel.offer.policy
+              ? 'The stay is charged to your company account.'
+              : 'The price is held for 20 minutes; the room is reserved when you pay.'}
           </p>
         </div>
       </div>
@@ -151,11 +159,16 @@ export default function HotelBookPage() {
             <dd>{BOARD_LABEL[sel.offer.board] ?? sel.offer.board}</dd>
             <dt>Cancellation</dt>
             <dd>{sel.offer.refundable ? `Free until ${sel.offer.freeCancellationUntil?.slice(0, 10)}` : 'Non-refundable'}</dd>
-            <dt>Your cost</dt>
-            <dd>{formatMoney(sel.offer.pricing.agentCost)}</dd>
-            <dt className="total">Customer pays</dt>
+            {!sel.offer.policy && (
+              <>
+                <dt>Your cost</dt>
+                <dd>{formatMoney(sel.offer.pricing.agentCost)}</dd>
+              </>
+            )}
+            <dt className="total">{sel.offer.policy ? 'Total' : 'Customer pays'}</dt>
             <dd className="total">{formatMoney(expected)}</dd>
           </dl>
+          <ExceptionReason policy={sel.offer.policy} value={reason} onChange={setReason} />
           {priceChanged && (
             <div className="alert warn">
               The hotel changed the price to <strong>{formatMoney(priceChanged)}</strong>.{' '}
@@ -174,7 +187,7 @@ export default function HotelBookPage() {
           )}
           {error && <div className="alert bad">{error}</div>}
           <button className="btn" disabled={busy || !!priceChanged}>
-            {busy ? 'Checking price…' : 'Hold price'}
+            {busy ? 'Checking price…' : sel.offer.policy ? (sel.offer.policy.inPolicy ? 'Book stay' : 'Send for approval') : 'Hold price'}
           </button>
         </div>
       </form>

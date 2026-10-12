@@ -41,6 +41,8 @@ export interface FlightOffer {
   fareBrand?: string;
   baggage: BaggageAllowance[];
   refundable: boolean;
+  /** Cabin the fare is sold in. */
+  cabin?: Cabin;
   price: { base: Money; taxes: Money; total: Money };
   validUntil: string; // ISO timestamp after which the offer must be repriced
 }

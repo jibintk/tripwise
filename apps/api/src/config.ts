@@ -8,6 +8,8 @@ const schema = z.object({
   SEARCH_SUPPLIER_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
   SEARCH_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   CORS_ORIGINS: z.string().default('http://localhost:3000'),
+  /** Public address of the portal, used in links inside emails. */
+  PORTAL_URL: z.string().default('http://localhost:3000'),
   /** e.g. smtp://localhost:1025 for Mailpit. Without it, emails are logged instead of sent. */
   SMTP_URL: z.string().optional(),
   MAIL_FROM: z.string().default('Tripwise <no-reply@tripwise.dev>'),

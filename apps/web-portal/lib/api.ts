@@ -90,8 +90,16 @@ export interface Pricing {
   net?: Money;
 }
 
+export interface PolicyVerdict {
+  inPolicy: boolean;
+  violations: string[];
+}
+
 export interface Offer {
   offerId: string;
+  cabin?: string;
+  lowestFare?: boolean;
+  policy?: PolicyVerdict;
   supplier: string;
   slices: Slice[];
   fareBrand?: string;
@@ -103,6 +111,7 @@ export interface Offer {
 
 export interface SearchResult {
   searchId: string;
+  policy?: { grade: string; approvalMode: string };
   fromCache: boolean;
   suppliers: { supplier: string; status: string; offers: number; error?: string }[];
   offers: Offer[];
@@ -136,6 +145,15 @@ export interface Booking {
   hotelConfirmation?: string | null;
   cancellation?: { penalty: Money; refunded: Money } | null;
   specialRequests?: string;
+  channel?: string;
+  policy?: {
+    grade: string;
+    inPolicy: boolean;
+    violations: string[];
+    reasonForException?: string;
+    missedSaving: number;
+    lowestSell?: number;
+  } | null;
   passengers: Passenger[];
   contact: { email: string; phone: string };
   pricing: Pricing;
@@ -216,6 +234,7 @@ export interface HotelResult {
   from: { agentCost: Money; sell: Money };
   cheapestBoard: string;
   freeCancellation: boolean;
+  policy?: PolicyVerdict;
 }
 
 export interface HotelSearchRequest {
@@ -227,6 +246,7 @@ export interface HotelSearchRequest {
 
 export interface RoomOffer {
   rateId: string;
+  policy?: PolicyVerdict;
   roomName: string;
   board: string;
   refundable: boolean;
@@ -247,3 +267,84 @@ export function newIdempotencyKey(): string {
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
+
+// ---- corporate travel ----
+
+export interface PolicyRecord {
+  grade: string;
+  approvalMode: string;
+  inPolicy: boolean;
+  violations: string[];
+  reasonForException?: string;
+  lowestSell?: number;
+  missedSaving: number;
+}
+
+export interface ApprovalItem {
+  id: string;
+  reference: string;
+  requestedAt?: string;
+  traveller: string;
+  product: 'flight' | 'hotel';
+  policy: PolicyRecord | null;
+  amount: number;
+  currency: string;
+  trip: string;
+  status?: string;
+  bookingStatus?: string;
+}
+
+export interface DecisionResult {
+  id: string;
+  decision: 'approve' | 'reject';
+  reference: string;
+  bookingStatus: string;
+  failureReason: string | null;
+}
+
+export type ApprovalMode = 'always' | 'out_of_policy' | 'never';
+
+export interface PolicyRules {
+  flight?: { maxCabin?: string; maxFarePerTraveller?: number; minAdvanceDays?: number; refundableOnly?: boolean };
+  hotel?: { maxStars?: number; maxNightlyPerRoom?: number };
+}
+
+export interface TravelPolicy {
+  id: string;
+  grade: string;
+  rules: PolicyRules;
+  approvalMode: ApprovalMode;
+}
+
+export interface Employee {
+  id: string;
+  name: string;
+  email: string;
+  roles: string[];
+  grade: string | null;
+  costCentre: string | null;
+  approverId: string | null;
+  approverName: string | null;
+}
+
+export interface SpendReport {
+  from: string;
+  to: string;
+  currency: string;
+  totals: { trips: number; spend: number; outOfPolicyTrips: number; missedSavings: number };
+  travellers: {
+    travellerId: string;
+    traveller: string;
+    costCentre: string | null;
+    trips: number;
+    spend: string | number;
+    outOfPolicyTrips: number;
+    missedSavings: string | number;
+  }[];
+}
+
+export const APPROVAL_MODE_LABEL: Record<ApprovalMode, string> = {
+  always: 'Every trip needs approval',
+  out_of_policy: 'Only out-of-policy trips need approval',
+  never: 'No approval (out-of-policy trips are reported)',
+};

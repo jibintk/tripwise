@@ -2,6 +2,7 @@
 
 import { useParams, useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import { PolicyBadge } from '@/components/PolicyBadge';
 import { Shell } from '@/components/Shell';
 import { api, BOARD_LABEL, HotelResult, HotelSearchRequest, RoomOffer } from '@/lib/api';
 import { formatMoney } from '@/lib/format';
@@ -57,12 +58,14 @@ export default function HotelRoomsPage() {
                     ) : (
                       <span className="tag">Non-refundable</span>
                     )}
+                    <PolicyBadge policy={o.policy} />
                   </div>
                 </div>
                 <div className="price-col">
                   <div className="price">{formatMoney(o.pricing.sell)}</div>
                   <div className="muted small">
-                    Your cost {formatMoney(o.pricing.agentCost)} · {formatMoney({ amount: Math.round(o.pricing.sell.amount / data.nights), currency: o.pricing.sell.currency })}
+                    {!o.policy && <>Your cost {formatMoney(o.pricing.agentCost)} · </>}
+                    {formatMoney({ amount: Math.round(o.pricing.sell.amount / data.nights), currency: o.pricing.sell.currency })}
                     /night
                   </div>
                   <button className="btn" style={{ marginTop: 10 }} onClick={() => choose(o)}>

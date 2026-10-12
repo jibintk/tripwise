@@ -3,6 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { Itinerary } from '@/components/Itinerary';
+import { ExceptionReason } from '@/components/PolicyBadge';
 import { Shell } from '@/components/Shell';
 import { api, ApiError, Booking, newIdempotencyKey, Offer, Passenger } from '@/lib/api';
 import { formatMoney, Money } from '@/lib/format';
@@ -12,6 +13,8 @@ const emptyPassenger = (): Passenger => ({ type: 'ADT', title: 'MR', firstName: 
 export default function BookPage() {
   const router = useRouter();
   const [offer, setOffer] = useState<Offer | null>(null);
+  const [searchId, setSearchId] = useState<string | undefined>();
+  const [reason, setReason] = useState('');
   const [passengers, setPassengers] = useState<Passenger[]>([]);
   const [contact, setContact] = useState({ email: '', phone: '' });
   const [expected, setExpected] = useState<Money | null>(null);
@@ -27,8 +30,9 @@ export default function BookPage() {
       router.replace('/search');
       return;
     }
-    const { offer: o, adults } = JSON.parse(raw) as { offer: Offer; adults: number };
+    const { offer: o, adults, searchId: sid } = JSON.parse(raw) as { offer: Offer; adults: number; searchId?: string };
     setOffer(o);
+    setSearchId(sid);
     setExpected(o.pricing.sell);
     setPassengers(Array.from({ length: adults }, emptyPassenger));
   }, [router]);
@@ -45,7 +49,14 @@ export default function BookPage() {
       const booking = await api<Booking>('/bookings', {
         method: 'POST',
         idempotencyKey: idempotencyKey.current,
-        body: JSON.stringify({ offerId: offer.offerId, passengers, contact, expectedSellAmount: expected.amount }),
+        body: JSON.stringify({
+          offerId: offer.offerId,
+          passengers,
+          contact,
+          expectedSellAmount: expected.amount,
+          searchId,
+          reasonForException: offer.policy && !offer.policy.inPolicy ? reason : undefined,
+        }),
       });
       sessionStorage.removeItem('tripwise.offer');
       router.push(`/bookings/${booking.reference}`);
@@ -54,6 +65,8 @@ export default function BookPage() {
         const newPrice = { amount: err.body.newSellAmount as number, currency: err.body.currency as string };
         setPriceChanged(newPrice);
         idempotencyKey.current = newIdempotencyKey();
+      } else if (err instanceof ApiError && err.code === 'NO_APPROVER') {
+        setError(err.message);
       } else if (err instanceof ApiError && err.code === 'OFFER_EXPIRED') {
         setError('This fare has expired. Please search again.');
       } else if (err instanceof ApiError && Array.isArray(err.body.errors)) {
@@ -74,7 +87,8 @@ export default function BookPage() {
         <div>
           <h1>Traveller details</h1>
           <p className="muted small" style={{ margin: 0 }}>
-            Enter names exactly as on the passport. The fare is held until you pay.
+            Enter names exactly as on the passport.{' '}
+            {offer.policy ? 'The trip is charged to your company account.' : 'The fare is held until you pay.'}
           </p>
         </div>
       </div>
@@ -128,13 +142,18 @@ export default function BookPage() {
           <dl className="kv">
             <dt>Fare</dt>
             <dd>{offer.fareBrand ?? 'Standard'}</dd>
-            <dt>Your cost</dt>
-            <dd>{formatMoney(offer.pricing.agentCost)}</dd>
-            <dt>Your markup</dt>
-            <dd>{formatMoney(offer.pricing.yourMarkup)}</dd>
-            <dt className="total">Customer pays</dt>
+            {!offer.policy && (
+              <>
+                <dt>Your cost</dt>
+                <dd>{formatMoney(offer.pricing.agentCost)}</dd>
+                <dt>Your markup</dt>
+                <dd>{formatMoney(offer.pricing.yourMarkup)}</dd>
+              </>
+            )}
+            <dt className="total">{offer.policy ? 'Total' : 'Customer pays'}</dt>
             <dd className="total">{formatMoney(expected)}</dd>
           </dl>
+          <ExceptionReason policy={offer.policy} value={reason} onChange={setReason} />
           {priceChanged && (
             <div className="alert warn">
               The airline changed the price to <strong>{formatMoney(priceChanged)}</strong>.{' '}
@@ -153,7 +172,7 @@ export default function BookPage() {
           )}
           {error && <div className="alert bad">{error}</div>}
           <button className="btn" disabled={busy || !!priceChanged}>
-            {busy ? 'Holding seats…' : 'Hold booking'}
+            {busy ? 'Holding seats…' : offer.policy ? (offer.policy.inPolicy ? 'Book trip' : 'Send for approval') : 'Hold booking'}
           </button>
         </div>
       </form>

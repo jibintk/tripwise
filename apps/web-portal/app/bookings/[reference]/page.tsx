@@ -18,6 +18,9 @@ const EVENT_LABEL: Record<string, string> = {
   cancelled: 'Cancelled',
   expired: 'Hold expired, seats released',
   ops_resolved: 'Resolved by operations',
+  approval_requested: 'Sent for approval',
+  approved: 'Approved',
+  rejected: 'Not approved',
 };
 
 export default function BookingDetailPage() {
@@ -134,6 +137,21 @@ export default function BookingDetailPage() {
         </div>
       )}
 
+      {booking.status === 'pending_approval' && (
+        <div className="alert warn" style={{ marginBottom: 16 }}>
+          Waiting for your approver. The trip is booked and paid automatically once approved; you will get an email either way.
+        </div>
+      )}
+      {booking.status === 'rejected' && (
+        <div className="alert bad" style={{ marginBottom: 16 }}>
+          Your approver did not approve this trip and the hold was released.
+        </div>
+      )}
+      {booking.status === 'expired' && booking.failureReason === 'PRICE_CHANGED_BEFORE_APPROVAL' && (
+        <div className="alert bad" style={{ marginBottom: 16 }}>
+          Approved, but the price changed while waiting, so nothing was booked. Please search again.
+        </div>
+      )}
       {booking.cancellation && (
         <div className="alert warn" style={{ marginBottom: 16 }}>
           Cancelled. Hotel penalty {formatMoney(booking.cancellation.penalty)}; refunded to your wallet{' '}
@@ -203,14 +221,41 @@ export default function BookingDetailPage() {
           <div className="card">
             <h2>Price</h2>
             <dl className="kv">
-              <dt>Your cost</dt>
-              <dd>{formatMoney(booking.pricing.agentCost)}</dd>
-              <dt>Your markup</dt>
-              <dd>{formatMoney(booking.pricing.yourMarkup)}</dd>
-              <dt className="total">Customer pays</dt>
+              {booking.channel !== 'b2e' && (
+                <>
+                  <dt>Your cost</dt>
+                  <dd>{formatMoney(booking.pricing.agentCost)}</dd>
+                  <dt>Your markup</dt>
+                  <dd>{formatMoney(booking.pricing.yourMarkup)}</dd>
+                </>
+              )}
+              <dt className="total">{booking.channel === 'b2e' ? 'Total (charged to company account)' : 'Customer pays'}</dt>
               <dd className="total">{formatMoney(booking.pricing.sell)}</dd>
             </dl>
           </div>
+          {booking.policy && (
+            <div className="card">
+              <h2>Travel policy</h2>
+              <p className="small" style={{ marginTop: -6 }}>
+                {booking.policy.inPolicy ? 'Within the ' : 'Outside the '}
+                {booking.policy.grade} policy.
+              </p>
+              {booking.policy.violations.length > 0 && (
+                <ul className="small" style={{ paddingLeft: 18 }}>
+                  {booking.policy.violations.map((v) => (
+                    <li key={v}>{v}</li>
+                  ))}
+                </ul>
+              )}
+              {booking.policy.reasonForException && <p className="small muted">Reason: {booking.policy.reasonForException}</p>}
+              {booking.policy.missedSaving > 0 && (
+                <p className="small muted">
+                  Lowest fare in the search was {formatMoney({ amount: booking.policy.lowestSell ?? 0, currency: booking.pricing.sell.currency })} (missed
+                  saving {formatMoney({ amount: booking.policy.missedSaving, currency: booking.pricing.sell.currency })}).
+                </p>
+              )}
+            </div>
+          )}
           <div className="card">
             <h2>History</h2>
             <ul style={{ margin: 0, paddingLeft: 18 }} className="small">

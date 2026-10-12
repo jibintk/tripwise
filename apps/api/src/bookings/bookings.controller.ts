@@ -22,6 +22,10 @@ const CreateBody = z.object({
   passengers: z.array(PassengerSchema).min(1).max(9),
   contact: z.object({ email: z.string().email(), phone: z.string().min(6).max(20) }),
   expectedSellAmount: z.number().int().positive().optional(),
+  /** Corporate trips: why an out-of-policy option was chosen */
+  reasonForException: z.string().trim().min(3).max(500).optional(),
+  /** Corporate trips: the search the option came from, to record the lowest logical fare */
+  searchId: z.string().max(64).optional(),
 });
 
 const ListQuery = z.object({

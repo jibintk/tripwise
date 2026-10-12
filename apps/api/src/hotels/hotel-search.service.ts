@@ -10,6 +10,8 @@ import { HotelSupplierRegistry } from '../flights/supplier-registry';
 import { PriceQuote, PricingContext } from '../pricing/pricing-engine';
 import { PricingService } from '../pricing/pricing.service';
 import { Hotel, HotelContentService } from './hotel-content.service';
+import { CorporateService } from '../corporate/corporate.service';
+import { channelFor } from '../flights/flight-search.service';
 
 export interface CachedHotelRate {
   rate: HotelRate;
@@ -34,6 +36,7 @@ export class HotelSearchService {
     private readonly content: HotelContentService,
     private readonly cache: CacheService,
     private readonly pricing: PricingService,
+    private readonly corporate: CorporateService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -45,14 +48,20 @@ export class HotelSearchService {
 
     const hotels = await this.content.getMany(cached.hotels.map((h) => h.hotelId));
     const pricer = await this.pricing.pricerFor(user.tenantPath);
+    const traveller = await this.corporate.travellerContext(user);
+    const nights = nightsBetween(req.checkIn, req.checkOut);
     const results = [];
     for (const entry of cached.hotels) {
       const rates = await this.rates(entry.rateIds);
       const hotel = hotels.get(entry.hotelId);
       if (!rates.length || !hotel) continue;
       const cheapest = rates.reduce((a, b) => (b.rate.price.total.amount < a.rate.price.total.amount ? b : a));
-      const q = pricer(cheapest.rate.price.total, this.pricingContext(req, cheapest.rate));
+      const q = pricer(cheapest.rate.price.total, this.pricingContext(req, cheapest.rate, channelFor(user)));
+      const policy = traveller
+        ? this.corporate.hotelVerdict(traveller, { stars: hotel.stars, sellAmount: q.sell.amount, currency: q.sell.currency, nights, rooms: req.rooms.length })
+        : undefined;
       results.push({
+        policy,
         ...hotel,
         suppliers: entry.suppliers.length,
         rooms: rates.length,
@@ -62,7 +71,7 @@ export class HotelSearchService {
       });
     }
     results.sort((a, b) => a.from.sell.amount - b.from.sell.amount);
-    return { searchId, nights: nightsBetween(req.checkIn, req.checkOut), suppliers: cached.suppliers, hotels: results };
+    return { searchId, nights, suppliers: cached.suppliers, hotels: results };
   }
 
   /**
@@ -76,6 +85,8 @@ export class HotelSearchService {
     const hotel = await this.content.get(hotelId);
     if (!entry || !hotel) throw notFound('Hotel');
     const pricer = await this.pricing.pricerFor(user.tenantPath);
+    const traveller = await this.corporate.travellerContext(user);
+    const nights = nightsBetween(cached.request.checkIn, cached.request.checkOut);
     const best = new Map<string, CachedHotelRate>();
     for (const r of await this.rates(entry.rateIds)) {
       const key = `${r.rate.roomName}|${r.rate.board}|${r.rate.refundable}`;
@@ -83,9 +94,15 @@ export class HotelSearchService {
       if (!current || r.rate.price.total.amount < current.rate.price.total.amount) best.set(key, r);
     }
     const offers = [...best.values()]
-      .map((r) => this.present(user, r.rate, pricer(r.rate.price.total, this.pricingContext(cached.request, r.rate))))
+      .map((r) => {
+        const offer = this.present(user, r.rate, pricer(r.rate.price.total, this.pricingContext(cached.request, r.rate, channelFor(user))));
+        if (!traveller) return offer;
+        const s = offer.pricing.sell;
+        const policy = this.corporate.hotelVerdict(traveller, { stars: hotel.stars, sellAmount: s.amount, currency: s.currency, nights, rooms: cached.request.rooms.length });
+        return { ...offer, policy };
+      })
       .sort((a, b) => a.pricing.sell.amount - b.pricing.sell.amount);
-    return { hotel, request: cached.request, nights: nightsBetween(cached.request.checkIn, cached.request.checkOut), offers };
+    return { hotel, request: cached.request, nights, offers };
   }
 
   async getRate(rateId: string): Promise<CachedHotelRate> {
@@ -94,8 +111,8 @@ export class HotelSearchService {
     return r;
   }
 
-  pricingContext(req: HotelSearchRequest, rate: HotelRate): PricingContext {
-    return { product: 'hotel', channel: 'b2b', supplier: rate.supplier, destination: req.city.toUpperCase() };
+  pricingContext(req: HotelSearchRequest, rate: HotelRate, channel: 'b2b' | 'b2e' | 'b2c' | 'pos' = 'b2b'): PricingContext {
+    return { product: 'hotel', channel, supplier: rate.supplier, destination: req.city.toUpperCase() };
   }
 
   present(user: AuthUser, rate: HotelRate, q: PriceQuote) {

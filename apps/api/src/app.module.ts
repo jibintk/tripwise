@@ -18,6 +18,9 @@ import { FLIGHT_SUPPLIERS, HOTEL_SUPPLIERS, HotelSupplierRegistry, SupplierRegis
 import { HotelContentService } from './hotels/hotel-content.service';
 import { HotelSearchService } from './hotels/hotel-search.service';
 import { HotelsController } from './hotels/hotels.controller';
+import { ApprovalService } from './corporate/approval.service';
+import { ApprovalsController, CorporateController } from './corporate/corporate.controller';
+import { CorporateService } from './corporate/corporate.service';
 import { HealthController } from './health.controller';
 import { OpsController } from './bookings/ops.controller';
 import { OutboxService } from './events/outbox.service';
@@ -52,6 +55,8 @@ import { TenancyService } from './tenancy/tenancy.service';
     BookingsController,
     OpsController,
     HotelsController,
+    CorporateController,
+    ApprovalsController,
   ],
   providers: [
     { provide: APP_CONFIG, useFactory: () => loadConfig() },
@@ -82,6 +87,8 @@ import { TenancyService } from './tenancy/tenancy.service';
     OutboxService,
     NotificationService,
     JobsService,
+    CorporateService,
+    ApprovalService,
   ],
 })
 export class AppModule implements NestModule {

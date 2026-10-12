@@ -10,6 +10,10 @@ export const SEED_USERS = {
   agencyAdmin: 'owner@safaridesk.dev',
   agent: 'agent@safaridesk.dev',
   otherAgent: 'agent@coastways.dev',
+  travelManager: 'manager@acme.dev',
+  approver: 'approver@acme.dev',
+  staff: 'staff@acme.dev',
+  executive: 'exec@acme.dev',
 };
 
 interface SeedTenant {
@@ -34,6 +38,7 @@ export async function seed(pool: Pool): Promise<void> {
       { code: 'kenya_gsa', type: 'gsa', parent: 'tripwise', name: 'Kenya GSA' },
       { code: 'safari_desk', type: 'agency', parent: 'kenya_gsa', name: 'Safari Desk Travel' },
       { code: 'coastways', type: 'agency', parent: 'kenya_gsa', name: 'Coastways Tours' },
+      { code: 'acme_kenya', type: 'corporate', parent: 'tripwise', name: 'Acme Kenya Ltd' },
     ];
     const ids: Record<string, string> = {};
     const paths: Record<string, string> = {};
@@ -56,6 +61,10 @@ export async function seed(pool: Pool): Promise<void> {
       [SEED_USERS.agencyAdmin, 'safari_desk', 'Amina Otieno', ['admin', 'agent']],
       [SEED_USERS.agent, 'safari_desk', 'Brian Mwangi', ['agent']],
       [SEED_USERS.otherAgent, 'coastways', 'Fatma Salim', ['agent']],
+      [SEED_USERS.travelManager, 'acme_kenya', 'Joyce Njeri', ['admin', 'traveller']],
+      [SEED_USERS.approver, 'acme_kenya', 'David Ochieng', ['approver', 'traveller']],
+      [SEED_USERS.staff, 'acme_kenya', 'Mary Akinyi', ['traveller']],
+      [SEED_USERS.executive, 'acme_kenya', 'Samuel Mutua', ['traveller']],
     ];
     for (const [email, tenant, name, roles] of users) {
       await client.query(
@@ -78,6 +87,7 @@ export async function seed(pool: Pool): Promise<void> {
     await account('kenya_gsa', 'wallet');
     const safariWallet = await account('safari_desk', 'wallet', 100_000); // USD 1,000 credit line
     const coastWallet = await account('coastways', 'wallet');
+    await account('acme_kenya', 'wallet', 2_000_000); // corporate billed on a USD 20,000 credit line
 
     const topup = async (wallet: string, amount: number) => {
       const txn = randomUUID();
@@ -103,6 +113,35 @@ export async function seed(pool: Pool): Promise<void> {
     await rule('safari_desk', 'Agency service fee', 'fixed', 1_500); // USD 15 per booking
     await rule('tripwise', 'Operator hotel markup', 'percent', 800, { product: 'hotel' }); // 8%
     await rule('kenya_gsa', 'GSA hotel markup', 'percent', 200, { product: 'hotel' }); // 2%
+
+    // Corporate travel policy: staff fly economy under USD 800 booked a week ahead; executives may fly business.
+    await client.query(
+      `INSERT INTO policy.travel_policy (corporate_id, grade, rules, approval_mode) VALUES
+         ($1, 'staff', $2, 'out_of_policy'), ($1, 'executive', $3, 'never')`,
+      [
+        ids.acme_kenya,
+        JSON.stringify({
+          flight: { maxCabin: 'ECONOMY', maxFarePerTraveller: 80_000, minAdvanceDays: 7 },
+          hotel: { maxStars: 4, maxNightlyPerRoom: 25_000 },
+        }),
+        JSON.stringify({ flight: { maxCabin: 'BUSINESS' }, hotel: { maxStars: 5 } }),
+      ],
+    );
+    const userId = async (email: string) =>
+      (await client.query(`SELECT id FROM tenancy.app_user WHERE email = $1`, [email])).rows[0].id as string;
+    const approverId = await userId(SEED_USERS.approver);
+    const managerId = await userId(SEED_USERS.travelManager);
+    for (const [email, grade, approver, cc] of [
+      [SEED_USERS.staff, 'staff', approverId, 'SALES'],
+      [SEED_USERS.approver, 'staff', managerId, 'SALES'],
+      [SEED_USERS.executive, 'executive', null, 'EXEC'],
+      [SEED_USERS.travelManager, 'staff', approverId, 'HR'],
+    ] as const) {
+      await client.query(
+        `INSERT INTO policy.employee (user_id, corporate_id, grade, cost_centre, approver_user_id) VALUES ($1,$2,$3,$4,$5)`,
+        [await userId(email), ids.acme_kenya, grade, cc, approver],
+      );
+    }
 
     await client.query('COMMIT');
   } catch (err) {

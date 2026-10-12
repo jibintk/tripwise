@@ -87,6 +87,7 @@ export class MockFlightSupplier implements FlightSupplier {
         fareBrand: brand,
         baggage: [{ passengerType: 'ADT', checkedPieces: brand === 'Lite' ? 0 : brand === 'Classic' ? 1 : 2, cabinKg: 7 }],
         refundable: brand === 'Flex',
+        cabin: req.cabin,
         price: {
           base: money(baseFare, this.currency),
           taxes: money(taxes, this.currency),

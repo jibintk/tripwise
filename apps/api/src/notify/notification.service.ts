@@ -11,6 +11,7 @@ const TEMPLATES: Record<string, (b: T.BookingView) => T.Rendered> = {
   'booking.failed': T.bookingFailed,
   'booking.expired': T.bookingExpired,
   'booking.cancelled': T.bookingCancelled,
+  'booking.rejected': T.bookingRejected,
 };
 
 /**
@@ -36,6 +37,8 @@ export class NotificationService {
     const render = TEMPLATES[event.type];
     const b = await this.db.one(`SELECT * FROM booking.booking WHERE reference = $1`, [event.aggregateId]);
     if (!render || !b) return;
+    // Corporate trips are paid on account (straight away, or on approval), so a "pay before" email would only confuse.
+    if (event.type === 'booking.held' && b.channel === 'b2e') return;
     let route: string;
     let departure: string;
     if (b.product === 'hotel') {

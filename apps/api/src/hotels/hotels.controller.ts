@@ -38,6 +38,10 @@ const BookBody = z.object({
   contact: z.object({ email: z.string().email(), phone: z.string().min(6).max(20) }),
   specialRequests: z.string().max(500).optional(),
   expectedSellAmount: z.number().int().positive().optional(),
+  /** Corporate trips: why an out-of-policy option was chosen */
+  reasonForException: z.string().trim().min(3).max(500).optional(),
+  /** Corporate trips: the search the option came from, to record the lowest logical fare */
+  searchId: z.string().max(64).optional(),
 });
 
 @Controller('hotels')

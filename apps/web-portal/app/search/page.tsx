@@ -1,10 +1,11 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { Itinerary } from '@/components/Itinerary';
+import { PolicyBadge } from '@/components/PolicyBadge';
 import { Shell } from '@/components/Shell';
-import { api, ApiError, Offer, SearchResult } from '@/lib/api';
+import { api, ApiError, Offer, SearchResult, session } from '@/lib/api';
 import { formatMoney } from '@/lib/format';
 
 function inDays(n: number): string {
@@ -13,6 +14,8 @@ function inDays(n: number): string {
 
 export default function SearchPage() {
   const router = useRouter();
+  const [corporate, setCorporate] = useState(false);
+  useEffect(() => setCorporate(session.user()?.tenant.type === 'corporate'), []);
   const [form, setForm] = useState({
     origin: 'NBO',
     destination: 'DXB',
@@ -58,7 +61,7 @@ export default function SearchPage() {
   }
 
   function choose(offer: Offer) {
-    sessionStorage.setItem('tripwise.offer', JSON.stringify({ offer, adults: form.adults }));
+    sessionStorage.setItem('tripwise.offer', JSON.stringify({ offer, adults: form.adults, searchId: result?.searchId }));
     router.push('/book');
   }
 
@@ -70,7 +73,9 @@ export default function SearchPage() {
         <div>
           <h1>Search flights</h1>
           <p className="muted small" style={{ margin: 0 }}>
-            Prices include your agency markup. Your cost is shown under each fare.
+            {corporate
+              ? 'Fares are checked against your travel policy. Out-of-policy fares can still be booked with a reason.'
+              : 'Prices include your agency markup. Your cost is shown under each fare.'}
           </p>
         </div>
       </div>
@@ -129,6 +134,7 @@ export default function SearchPage() {
         {result && result.offers.length > 0 && (
           <p className="muted small" style={{ margin: 0 }}>
             {result.offers.length} fares, cheapest first{result.fromCache ? ' · from recent search' : ''}
+            {result.policy ? ` · checked against the ${result.policy.grade} travel policy` : ''}
           </p>
         )}
         {result?.offers.map((o) => (
@@ -141,11 +147,13 @@ export default function SearchPage() {
                   {o.baggage[0]?.checkedPieces ? `${o.baggage[0].checkedPieces} checked bag` : 'Cabin bag only'}
                 </span>
                 {o.refundable && <span className="tag good">Refundable</span>}
+                {o.lowestFare && <span className="tag brand">Lowest fare</span>}
+                <PolicyBadge policy={o.policy} />
               </div>
             </div>
             <div className="price-col">
               <div className="price">{formatMoney(o.pricing.sell)}</div>
-              <div className="muted small">Your cost {formatMoney(o.pricing.agentCost)}</div>
+              {!o.policy && <div className="muted small">Your cost {formatMoney(o.pricing.agentCost)}</div>}
               <button className="btn" style={{ marginTop: 10 }} onClick={() => choose(o)}>
                 Select
               </button>

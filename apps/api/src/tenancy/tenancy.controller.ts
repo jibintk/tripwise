@@ -18,7 +18,7 @@ const StatusBody = z.object({ status: z.enum(['active', 'suspended']) });
 const CreateUserBody = z.object({
   email: z.string().email(),
   name: z.string().min(2).max(120),
-  roles: z.array(z.enum(['admin', 'agent', 'finance', 'ops'])).min(1),
+  roles: z.array(z.enum(['admin', 'agent', 'traveller', 'approver', 'finance', 'ops'])).min(1),
 });
 
 @Controller('tenants')

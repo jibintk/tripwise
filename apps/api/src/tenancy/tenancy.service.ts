@@ -95,7 +95,8 @@ export class TenancyService {
     if (!hasRole(user, 'admin')) throw forbidden('Only admins can create users');
     const t = await this.get(tenantId);
     if (!this.inScope(user, t.path)) throw notFound('Tenant');
-    const notHeld = input.roles.filter((r) => r !== 'agent' && !user.roles.includes(r));
+    const UNPRIVILEGED: Role[] = ['agent', 'traveller', 'approver'];
+    const notHeld = input.roles.filter((r) => !UNPRIVILEGED.includes(r) && !user.roles.includes(r));
     if (notHeld.length) throw forbidden(`You cannot grant roles you do not hold: ${notHeld.join(', ')}`);
     if (t.type !== 'operator' && input.roles.some((r) => r === 'finance' || r === 'ops')) {
       throw conflict('INVALID_ROLE', 'Finance and ops roles exist only at the operator');

@@ -1,4 +1,11 @@
-export type Role = 'admin' | 'agent' | 'finance' | 'ops';
+/**
+ * admin: manages its organisation (agency admin, corporate travel manager)
+ * agent: books for customers (agencies)
+ * traveller: books own business trips (corporates)
+ * approver: approves colleagues' trips (corporates)
+ * finance, ops: operator only
+ */
+export type Role = 'admin' | 'agent' | 'traveller' | 'approver' | 'finance' | 'ops';
 
 /** The authenticated caller, resolved from the JWT on every request. */
 export interface AuthUser {

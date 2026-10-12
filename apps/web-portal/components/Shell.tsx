@@ -12,20 +12,25 @@ export const notifyWalletChanged = () => window.dispatchEvent(new Event(WALLET_C
 
 interface NavItem {
   href: string;
-  label: string;
+  label: string | ((u: SessionUser) => string);
   show: (u: SessionUser) => boolean;
 }
 
 const isOperator = (u: SessionUser) => u.tenant.type === 'operator';
+const isCorporate = (u: SessionUser) => u.tenant.type === 'corporate';
 const can = (u: SessionUser, ...roles: string[]) => roles.some((r) => u.roles.includes(r));
 
 const NAV: NavItem[] = [
-  { href: '/search', label: 'Flights', show: (u) => can(u, 'agent') || isOperator(u) },
-  { href: '/hotels', label: 'Hotels', show: (u) => can(u, 'agent') || isOperator(u) },
-  { href: '/bookings', label: 'Bookings', show: () => true },
-  { href: '/wallet', label: 'Wallet', show: (u) => !isOperator(u) },
-  { href: '/admin/agencies', label: 'Agencies', show: (u) => can(u, 'admin') && u.tenant.type !== 'branch' },
-  { href: '/admin/pricing', label: 'Pricing', show: (u) => can(u, 'admin') },
+  { href: '/search', label: 'Flights', show: (u) => can(u, 'agent', 'traveller') || isOperator(u) },
+  { href: '/hotels', label: 'Hotels', show: (u) => can(u, 'agent', 'traveller') || isOperator(u) },
+  { href: '/bookings', label: (u) => (isCorporate(u) ? 'Trips' : 'Bookings'), show: () => true },
+  { href: '/approvals', label: 'Approvals', show: (u) => isCorporate(u) && can(u, 'approver', 'admin') },
+  { href: '/corporate/policies', label: 'Travel policy', show: (u) => isCorporate(u) && can(u, 'admin') },
+  { href: '/corporate/employees', label: 'Employees', show: (u) => isCorporate(u) && can(u, 'admin') },
+  { href: '/corporate/reports', label: 'Spend', show: (u) => isCorporate(u) && can(u, 'admin') },
+  { href: '/wallet', label: (u) => (isCorporate(u) ? 'Account' : 'Wallet'), show: (u) => !isOperator(u) && (!isCorporate(u) || can(u, 'admin')) },
+  { href: '/admin/agencies', label: 'Agencies', show: (u) => can(u, 'admin') && !['branch', 'corporate'].includes(u.tenant.type) },
+  { href: '/admin/pricing', label: 'Pricing', show: (u) => can(u, 'admin') && !isCorporate(u) },
   { href: '/admin/wallets', label: 'Wallets', show: (u) => can(u, 'finance', 'admin') && isOperator(u) },
   { href: '/admin/ops', label: 'Ops queue', show: (u) => can(u, 'ops', 'admin') && isOperator(u) },
 ];
@@ -63,11 +68,11 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <nav className="nav">
           {NAV.filter((n) => n.show(user)).map((n) => (
             <Link key={n.href} href={n.href} className={path?.startsWith(n.href) ? 'active' : ''}>
-              {n.label}
+              {typeof n.label === 'function' ? n.label(user) : n.label}
             </Link>
           ))}
         </nav>
-        {wallet && !isOperator(user) && (
+        {wallet && !isOperator(user) && !isCorporate(user) && (
           <span className="wallet-pill" title="Balance plus credit line">
             Available {formatMoney({ amount: wallet.available, currency: wallet.currency })}
           </span>

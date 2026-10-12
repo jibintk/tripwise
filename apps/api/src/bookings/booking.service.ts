@@ -1,4 +1,4 @@
-import { HttpStatus, Injectable, Logger } from '@nestjs/common';
+import { HttpStatus, Inject, Injectable, Logger } from '@nestjs/common';
 import {
   FlightOffer,
   HotelGuest,
@@ -10,7 +10,7 @@ import {
   SupplierErrorCode,
 } from '@tripwise/contracts';
 import { nightsBetween } from '@tripwise/supplier-gateway';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { PoolClient } from 'pg';
 import { AuthUser, hasRole } from '../auth/auth.types';
 import { AppError, badRequest, conflict, forbidden, notFound } from '../common/errors';
@@ -18,7 +18,11 @@ import { DbService } from '../db/db.service';
 import { renderETicket } from '../documents/eticket';
 import { renderHotelVoucher } from '../documents/voucher';
 import { OutboxService } from '../events/outbox.service';
-import { FlightSearchService } from '../flights/flight-search.service';
+import { channelFor, FlightSearchService } from '../flights/flight-search.service';
+import { CorporateService, TravellerContext } from '../corporate/corporate.service';
+import { Cabin, needsApproval, PolicyVerdict } from '../corporate/policy-engine';
+import { approvalRequested } from '../notify/templates';
+import { APP_CONFIG, AppConfig } from '../config';
 import { HotelSupplierRegistry, SupplierRegistry } from '../flights/supplier-registry';
 import { HotelSearchService } from '../hotels/hotel-search.service';
 import { LedgerService } from '../payments/ledger.service';
@@ -26,7 +30,13 @@ import { PriceQuote } from '../pricing/pricing-engine';
 import { PricingService } from '../pricing/pricing.service';
 import { TenancyService } from '../tenancy/tenancy.service';
 
-export interface CreateBookingInput {
+/** Corporate trips only: why an out-of-policy option was chosen, and the search it came from. */
+interface CorporateExtras {
+  reasonForException?: string;
+  searchId?: string;
+}
+
+export interface CreateBookingInput extends CorporateExtras {
   offerId: string;
   passengers: Passenger[];
   contact: { email: string; phone: string };
@@ -34,7 +44,7 @@ export interface CreateBookingInput {
   expectedSellAmount?: number;
 }
 
-export interface CreateHotelBookingInput {
+export interface CreateHotelBookingInput extends CorporateExtras {
   rateId: string;
   guests: HotelGuest[];
   contact: { email: string; phone: string };
@@ -73,6 +83,8 @@ export interface BookingRow {
   hold_expires_at: Date | null;
   ticket_numbers: string[];
   fulfilment: Record<string, unknown>;
+  policy: PolicyRecord | null;
+  channel: string;
   failure_reason: string | null;
   ops_resolved_at: Date | null;
   ops_note: string | null;
@@ -80,7 +92,20 @@ export interface BookingRow {
   updated_at: Date;
 }
 
+/** What a corporate booking was checked against, stored with it for audit and reporting. */
+export interface PolicyRecord {
+  grade: string;
+  approvalMode: string;
+  inPolicy: boolean;
+  violations: string[];
+  reasonForException?: string;
+  lowestSell?: number;
+  missedSaving: number;
+  approverId?: string | null;
+}
+
 const SELECT = `SELECT *, tenant_path::text AS tenant_path FROM booking.booking`;
+const APPROVAL_LINK_HOURS = 48;
 const RETURNING = `RETURNING *, tenant_path::text AS tenant_path`;
 const TICKET_ATTEMPTS = 2;
 /** Hotels have no supplier-side hold; the checked price is honoured for this long. */
@@ -96,6 +121,7 @@ const PUBLIC_EVENTS: Record<string, string> = {
   booking_failed: 'booking.failed',
   cancelled: 'booking.cancelled',
   expired: 'booking.expired',
+  rejected: 'booking.rejected',
 };
 
 /**
@@ -119,6 +145,8 @@ export class BookingService {
     private readonly ledger: LedgerService,
     private readonly tenancy: TenancyService,
     private readonly outbox: OutboxService,
+    private readonly corporate: CorporateService,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
   // ---------- create ----------
@@ -132,11 +160,30 @@ export class BookingService {
     const ctx = { ...this.search.ctx(user, traceId), idempotencyKey };
     const offer = await this.registry.call(cached.supplier, ctx, (s) => s.reprice(cached, ctx));
     const pricer = await this.pricing.pricerFor(user.tenantPath);
-    const quote = pricer(offer.price.total, this.search.pricingContext(undefined, offer));
+    const quote = pricer(offer.price.total, this.search.pricingContext(undefined, offer, channelFor(user)));
     this.checkExpectedPrice(input.expectedSellAmount, quote);
+
+    const traveller = await this.corporate.travellerContext(user);
+    const policy = traveller
+      ? await this.corporatePolicy(
+          traveller,
+          this.corporate.flightVerdict(traveller, {
+            cabin: (offer.cabin ?? 'ECONOMY') as Cabin,
+            sellAmount: quote.sell.amount,
+            currency: quote.sell.currency,
+            travellers: input.passengers.length,
+            departureDate: offer.slices[0].segments[0].departureLocal.slice(0, 10),
+            refundable: offer.refundable,
+          }),
+          input,
+          quote.sell.amount,
+          input.searchId ? await this.search.lowestSell(user, input.searchId) : undefined,
+        )
+      : null;
 
     const hold = await this.registry.call(offer.supplier, ctx, (s) => s.hold(offer, input.passengers, ctx));
     return this.insertHeld(user, idempotencyKey!, traceId, {
+      policy,
       product: 'flight',
       supplier: offer.supplier,
       snapshot: offer,
@@ -159,12 +206,29 @@ export class BookingService {
     const ctx = { ...this.hotelSearch.ctx(user, traceId), idempotencyKey };
     const rate = await this.hotelRegistry.call(cached.rate.supplier, ctx, (s) => s.checkRate(cached.rate, cached.request, ctx));
     const pricer = await this.pricing.pricerFor(user.tenantPath);
-    const quote = pricer(rate.price.total, this.hotelSearch.pricingContext(cached.request, rate));
+    const quote = pricer(rate.price.total, this.hotelSearch.pricingContext(cached.request, rate, channelFor(user)));
     this.checkExpectedPrice(input.expectedSellAmount, quote);
 
     const hotel = await this.hotelContent(cached.hotelId);
+    const traveller = await this.corporate.travellerContext(user);
+    const policy = traveller
+      ? await this.corporatePolicy(
+          traveller,
+          this.corporate.hotelVerdict(traveller, {
+            stars: hotel.stars,
+            sellAmount: quote.sell.amount,
+            currency: quote.sell.currency,
+            nights: nightsBetween(cached.request.checkIn, cached.request.checkOut),
+            rooms: cached.request.rooms.length,
+          }),
+          input,
+          quote.sell.amount,
+          undefined,
+        )
+      : null;
     const snapshot: HotelSnapshot = { kind: 'hotel', hotel, rate, request: cached.request, specialRequests: input.specialRequests };
     return this.insertHeld(user, idempotencyKey!, traceId, {
+      policy,
       product: 'hotel',
       supplier: rate.supplier,
       snapshot,
@@ -179,28 +243,191 @@ export class BookingService {
   // ---------- pay and fulfil ----------
 
   async pay(user: AuthUser, reference: string, traceId: string) {
-    const operatorId = await this.operatorIdFor(user.tenantPath);
+    const b = await this.getRow(user, reference);
+    if (b.tenant_id !== user.tenantId) {
+      throw new AppError(HttpStatus.FORBIDDEN, 'FORBIDDEN', 'Only the booking organisation can pay for this booking');
+    }
+    if (b.status === 'pending_approval') throw conflict('APPROVAL_PENDING', 'This trip is waiting for approval');
+    return this.view(user, await this.payInternal(b.reference, traceId, user.id));
+  }
 
+  /** Charges the booking organisation's wallet and fulfils. Used by agents paying and by approvals. */
+  private async payInternal(reference: string, traceId: string, actorId: string): Promise<BookingRow> {
     const charged = await this.db.tx(async (client) => {
-      const b = await this.lockInScope(client, user, reference);
+      const { rows: locked } = await client.query<BookingRow>(`${SELECT} WHERE reference = $1 FOR UPDATE`, [reference]);
+      const b = locked[0];
+      if (!b) throw notFound('Booking');
       if (['paid', 'ticketing', 'confirmed'].includes(b.status)) return { booking: b, charged: false };
       if (b.status !== 'held') throw conflict('INVALID_STATE', `A ${b.status} booking cannot be paid`);
       if (b.hold_expires_at && b.hold_expires_at.getTime() < Date.now()) {
         throw conflict(SupplierErrorCode.HOLD_EXPIRED, 'The hold expired. Search again to rebook.');
       }
+      const operatorId = await this.operatorIdFor(b.tenant_path);
       await this.ledger.chargeBooking(client, b.tenant_id, operatorId, money(b.agent_cost_amount, b.currency), b.reference);
       const { rows } = await client.query<BookingRow>(
         `UPDATE booking.booking SET status = 'ticketing', updated_at = now() WHERE id = $1 ${RETURNING}`,
         [b.id],
       );
-      await this.event(client, b, 'paid', { amount: b.agent_cost_amount, currency: b.currency, traceId, by: user.id });
-      return { booking: rows[0], charged: true };
+      await this.event(client, b, 'paid', { amount: b.agent_cost_amount, currency: b.currency, traceId, by: actorId });
+      return { booking: rows[0], charged: true, operatorId };
     });
-
     // Already paid by an earlier (or concurrent) request: report its current state, never charge twice.
-    if (!charged.charged) return this.view(user, charged.booking);
+    if (!charged.charged) return charged.booking;
     // Money is taken and committed; fulfilment happens outside that transaction.
-    return this.view(user, await this.fulfil(charged.booking, operatorId, traceId));
+    return this.fulfil(charged.booking, charged.operatorId!, traceId);
+  }
+
+  // ---------- corporate approvals ----------
+
+  /**
+   * After a corporate trip is held: send it for approval when the policy asks for it, otherwise
+   * pay from the company account and fulfil straight away.
+   */
+  private async afterCorporateHold(user: AuthUser, b: BookingRow, traceId: string): Promise<BookingRow> {
+    const policy = b.policy!;
+    if (!needsApproval(policy.approvalMode as 'always' | 'out_of_policy' | 'never', policy)) {
+      return this.payInternal(b.reference, traceId, user.id);
+    }
+    const token = randomBytes(24).toString('base64url');
+    return this.db.tx(async (client) => {
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'pending_approval', updated_at = now() WHERE id = $1 AND status = 'held' ${RETURNING}`,
+        [b.id],
+      );
+      const { rows: req } = await client.query<{ id: string }>(
+        `INSERT INTO policy.approval_request (booking_id, booking_reference, corporate_id, traveller_id, approver_id, token_hash, token_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(hours => $7)) RETURNING id`,
+        [b.id, b.reference, b.tenant_id, user.id, policy.approverId, sha256(token), APPROVAL_LINK_HOURS],
+      );
+      const approver = await client.query<{ email: string; name: string }>(`SELECT email, name FROM tenancy.app_user WHERE id = $1`, [
+        policy.approverId,
+      ]);
+      const link = `${this.config.PORTAL_URL}/approve/${req[0].id}?token=${token}`;
+      const msg = approvalRequested({
+        approverName: approver.rows[0].name,
+        travellerName: user.name,
+        reference: b.reference,
+        trip: this.tripSummary(b),
+        price: `${b.currency} ${(b.agent_cost_amount / 100).toFixed(2)}`,
+        violations: policy.violations,
+        reason: policy.reasonForException,
+        link,
+        validHours: APPROVAL_LINK_HOURS,
+      });
+      // Queued directly (not via the outbox) so the one-time link never sits in an event payload.
+      await client.query(
+        `INSERT INTO notify.notification (channel, recipient, template, subject, body_text, body_html, ref_type, ref_id, dedupe_key)
+         VALUES ('email', $1, 'approval.requested', $2, $3, $4, 'booking', $5, $6)`,
+        [approver.rows[0].email, msg.subject, msg.text, msg.html, b.reference, `approval.requested:${req[0].id}`],
+      );
+      await this.event(client, b, 'approval_requested', { approvalId: req[0].id, approverId: policy.approverId, traceId });
+      return rows[0];
+    });
+  }
+
+  /**
+   * Continues an approved trip. If the supplier hold lapsed while it waited, the trip is held again;
+   * if the price moved in the meantime, the trip expires and the traveller rebooks, because the
+   * approver agreed to a specific price.
+   */
+  async resumeAfterApproval(reference: string, approverId: string, traceId: string): Promise<BookingRow> {
+    const b = await this.db.one<BookingRow>(`${SELECT} WHERE reference = $1`, [reference]);
+    if (!b) throw notFound('Booking');
+    if (b.status !== 'pending_approval') throw conflict('INVALID_STATE', `A ${b.status} booking cannot be approved`);
+    let refreshed: { pnr: string | null; holdExpiresAt: string | null } | 'price_changed' | null = null;
+    if (b.hold_expires_at && b.hold_expires_at.getTime() < Date.now()) refreshed = await this.reHold(b, traceId);
+    if (refreshed === 'price_changed') {
+      return this.db.tx(async (client) => {
+        const { rows } = await client.query<BookingRow>(
+          `UPDATE booking.booking SET status = 'expired', failure_reason = 'PRICE_CHANGED_BEFORE_APPROVAL', updated_at = now()
+            WHERE id = $1 ${RETURNING}`,
+          [b.id],
+        );
+        await this.event(client, b, 'expired', { reason: 'PRICE_CHANGED_BEFORE_APPROVAL', approvedBy: approverId });
+        return rows[0];
+      });
+    }
+    await this.db.tx(async (client) => {
+      await client.query(
+        `UPDATE booking.booking SET status = 'held', pnr = COALESCE($2, pnr), hold_expires_at = COALESCE($3, hold_expires_at), updated_at = now()
+          WHERE id = $1`,
+        [b.id, refreshed?.pnr ?? null, refreshed?.holdExpiresAt ?? null],
+      );
+      await this.event(client, b, 'approved', { by: approverId, reHeld: !!refreshed, traceId });
+    });
+    return this.payInternal(b.reference, traceId, approverId);
+  }
+
+  async rejectAfterApproval(reference: string, approverId: string, comment: string | undefined, traceId: string): Promise<BookingRow> {
+    const b = await this.db.one<BookingRow>(`${SELECT} WHERE reference = $1`, [reference]);
+    if (!b) throw notFound('Booking');
+    if (b.status !== 'pending_approval') throw conflict('INVALID_STATE', `A ${b.status} booking cannot be rejected`);
+    await this.release(b, traceId).catch((err) => this.logger.warn(`Release after rejection failed: ${(err as Error).message}`));
+    return this.db.tx(async (client) => {
+      const { rows } = await client.query<BookingRow>(
+        `UPDATE booking.booking SET status = 'rejected', updated_at = now() WHERE id = $1 ${RETURNING}`,
+        [b.id],
+      );
+      await this.event(client, b, 'rejected', { by: approverId, comment });
+      return rows[0];
+    });
+  }
+
+  /** Re-holds an expired hold at the supplier; returns 'price_changed' if the price is no longer the approved one. */
+  private async reHold(b: BookingRow, traceId: string) {
+    const ctx = { traceId, tenantId: b.tenant_id, timeoutMs: 30_000 };
+    const pricer = await this.pricing.pricerFor(b.tenant_path);
+    if (b.product === 'hotel') {
+      const s = b.offer_snapshot as HotelSnapshot;
+      const rate = await this.hotelRegistry.call(b.supplier, ctx, (sup) => sup.checkRate(s.rate, s.request, ctx));
+      const q = pricer(rate.price.total, this.hotelSearch.pricingContext(s.request, rate, 'b2e'));
+      if (q.sell.amount !== b.sell_amount) return 'price_changed' as const;
+      return { pnr: null, holdExpiresAt: new Date(Date.now() + HOTEL_PRICE_LOCK_MINUTES * 60_000).toISOString() };
+    }
+    const offer = await this.registry.call(b.supplier, ctx, (sup) => sup.reprice(b.offer_snapshot, ctx));
+    const q = pricer(offer.price.total, this.search.pricingContext(undefined, offer, 'b2e'));
+    if (q.sell.amount !== b.sell_amount) return 'price_changed' as const;
+    const hold = await this.registry.call(b.supplier, ctx, (sup) => sup.hold(offer, b.passengers as Passenger[], ctx));
+    return { pnr: hold.pnr, holdExpiresAt: hold.holdExpiresAt ?? null };
+  }
+
+  /** Checks the policy verdict before anything is held, and builds the record stored with the booking. */
+  private async corporatePolicy(
+    traveller: TravellerContext,
+    verdict: PolicyVerdict,
+    input: CorporateExtras,
+    sellAmount: number,
+    lowestSell: number | undefined,
+  ): Promise<PolicyRecord> {
+    if (!verdict.inPolicy && !input.reasonForException?.trim()) {
+      throw new AppError(HttpStatus.UNPROCESSABLE_ENTITY, 'REASON_REQUIRED', 'This option is outside your travel policy. Give a reason to continue.', {
+        violations: verdict.violations,
+      });
+    }
+    const record: PolicyRecord = {
+      grade: traveller.grade,
+      approvalMode: traveller.policy.approvalMode,
+      inPolicy: verdict.inPolicy,
+      violations: verdict.violations,
+      reasonForException: verdict.inPolicy ? undefined : input.reasonForException?.trim(),
+      lowestSell,
+      missedSaving: lowestSell !== undefined ? Math.max(0, sellAmount - lowestSell) : 0,
+      approverId: traveller.approverId,
+    };
+    if (needsApproval(traveller.policy.approvalMode, verdict) && !traveller.approverId) {
+      throw conflict('NO_APPROVER', 'This trip needs approval but you have no approver. Ask your travel manager to assign one.');
+    }
+    return record;
+  }
+
+  private tripSummary(b: BookingRow): string {
+    if (b.product === 'hotel') {
+      const s = b.offer_snapshot as HotelSnapshot;
+      return `${s.hotel.name}, ${s.hotel.city}, ${s.request.checkIn} to ${s.request.checkOut}`;
+    }
+    const first = b.offer_snapshot.slices[0].segments[0];
+    const last = b.offer_snapshot.slices[0].segments.at(-1)!;
+    return `${first.origin} to ${last.destination}${b.offer_snapshot.slices.length > 1 ? ' and back' : ''}, ${first.departureLocal.slice(0, 10)}`;
   }
 
   private fulfil(b: BookingRow, operatorId: string, traceId: string): Promise<BookingRow> {
@@ -507,6 +734,7 @@ export class BookingService {
     idempotencyKey: string,
     traceId: string,
     p: {
+      policy?: PolicyRecord | null;
       product: Product;
       supplier: string;
       snapshot: object;
@@ -523,8 +751,8 @@ export class BookingService {
         const { rows } = await client.query<BookingRow>(
           `INSERT INTO booking.booking (reference, tenant_id, tenant_path, created_by, channel, product, status, supplier,
              offer_snapshot, passengers, contact, currency, net_amount, agent_cost_amount, sell_amount,
-             pricing_breakdown, pnr, hold_expires_at, idempotency_key)
-           VALUES ($1,$2,$3::ltree,$4,'b2b',$5,'held',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ${RETURNING}`,
+             pricing_breakdown, pnr, hold_expires_at, idempotency_key, policy)
+           VALUES ($1,$2,$3::ltree,$4,$18,$5,'held',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$19) ${RETURNING}`,
           [
             newReference(),
             user.tenantId,
@@ -543,11 +771,14 @@ export class BookingService {
             p.pnr,
             p.holdExpiresAt,
             idempotencyKey,
+            channelFor(user),
+            p.policy ? JSON.stringify(p.policy) : null,
           ],
         );
         await this.event(client, rows[0], 'held', { pnr: p.pnr, traceId, by: user.id });
         return rows[0];
       });
+      if (row.policy) return this.view(user, await this.afterCorporateHold(user, row, traceId));
       return this.view(user, row);
     } catch (err) {
       // Two requests with the same key raced: release our duplicate hold, return the winner.
@@ -585,16 +816,6 @@ export class BookingService {
     return b;
   }
 
-  private async lockInScope(client: PoolClient, user: AuthUser, reference: string): Promise<BookingRow> {
-    const { rows } = await client.query<BookingRow>(`${SELECT} WHERE reference = $1 FOR UPDATE`, [reference.toUpperCase()]);
-    const b = rows[0];
-    if (!b || !this.canSee(user, b)) throw notFound('Booking');
-    if (b.tenant_id !== user.tenantId) {
-      throw new AppError(HttpStatus.FORBIDDEN, 'FORBIDDEN', 'Only the booking agency can pay for this booking');
-    }
-    return b;
-  }
-
   /** Appends to the booking's own history and, for public state changes, to the outbox in the same transaction. */
   private async event(client: PoolClient, b: Pick<BookingRow, 'id' | 'reference' | 'tenant_id'>, type: string, data: Record<string, unknown>) {
     await client.query(`INSERT INTO booking.booking_event (booking_id, type, data) VALUES ($1, $2, $3)`, [
@@ -617,6 +838,8 @@ export class BookingService {
       holdExpiresAt: b.hold_expires_at,
       failureReason: b.failure_reason,
       opsResolution: b.ops_resolved_at ? { at: b.ops_resolved_at, note: b.ops_note } : null,
+      channel: b.channel,
+      policy: b.policy,
       passengers: b.passengers,
       contact: b.contact,
       pricing: {
@@ -657,6 +880,10 @@ export class BookingService {
 }
 
 /** Human-friendly reference, e.g. TW-7K3M9Q. No 0/O/1/I to avoid misreading over the phone. */
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
 function newReference(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = randomBytes(6);

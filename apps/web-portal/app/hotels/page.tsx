@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { FormEvent, useState } from 'react';
+import { PolicyBadge } from '@/components/PolicyBadge';
 import { Shell } from '@/components/Shell';
 import { api, ApiError, HotelResult, HotelSearchRequest } from '@/lib/api';
 import { formatMoney } from '@/lib/format';
@@ -135,12 +136,13 @@ export default function HotelSearchPage() {
                   </span>
                 ))}
                 {h.freeCancellation && <span className="tag good">Free cancellation available</span>}
+                <PolicyBadge policy={h.policy} />
               </div>
             </div>
             <div className="price-col">
               <div className="muted small">from</div>
               <div className="price">{formatMoney(h.from.sell)}</div>
-              <div className="muted small">Your cost {formatMoney(h.from.agentCost)}</div>
+              {!h.policy && <div className="muted small">Your cost {formatMoney(h.from.agentCost)}</div>}
               <Link className="btn" style={{ marginTop: 10, display: 'inline-flex', alignItems: 'center' }} href={`/hotels/${result.searchId}/${h.id}`}>
                 View rooms
               </Link>

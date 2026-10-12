@@ -36,6 +36,8 @@ const STATUS_LABEL: Record<string, string> = {
   cancelled: 'Cancelled',
   failed: 'Failed, refunded',
   expired: 'Hold expired',
+  pending_approval: 'Waiting for approval',
+  rejected: 'Not approved',
 };
 
 export function statusLabel(status: string, product: string = 'flight'): string {

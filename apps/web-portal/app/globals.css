@@ -117,3 +117,12 @@ tr:last-child td { border-bottom: 0; }
   .topbar { gap: 12px; padding: 0 12px; }
   .who { display: none; }
 }
+
+.status.pending_approval { background: var(--warn-soft); color: var(--warn); }
+.status.rejected { background: var(--bad-soft); color: var(--bad); }
+.tag.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.tag.brand { background: var(--brand-soft); color: var(--brand); border-color: transparent; }
+textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; min-height: 70px; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 720px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+table select, table input { height: 32px; min-width: 0; width: 100%; }

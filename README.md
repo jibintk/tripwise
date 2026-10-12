@@ -21,6 +21,7 @@ The first vertical slice: an agency searches flights, books, pays from its walle
 - **Background jobs**: hold-expiry sweep (releases seats), recovery of bookings stuck in ticketing after a crash, outbox delivery and email sending. Safe to run on several API instances.
 - **E-ticket PDF** download for ticketed bookings.
 - **Back office**: agencies tree (create, suspend with immediate lock-out), users with one-time passwords, markup rules, wallets with top-ups and credit lines (operator finance), and an operations queue for failed or stuck bookings.
+- **Corporate travel (B2E)**: travel policies per employee grade (cabin, fare cap, booking window, refundable fares, hotel stars and nightly cap). Search results are marked in or out of policy and the lowest fare is highlighted. Out-of-policy trips need a reason and, depending on the policy, go to the employee's approver, who decides in the portal or with a one-click link in the email (single-use, 48 hours). Approved trips are paid from the company account and ticketed straight away; if the price changed while waiting, nothing is booked. Travel managers set policies, grades, cost centres and approvers, and see spend, compliance and missed savings per traveller.
 - **B2B partner portal** (Next.js): sign in, search flights and hotels, enter travellers or guests, hold, pay and ticket or book, download e-tickets and vouchers, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
 
 ## Repository layout
@@ -37,7 +38,7 @@ apps/
       bookings/        booking saga
       db/              SQL migrations, migration runner, seed data
     test/              integration tests against a real Postgres
-  web-portal/          Next.js partner portal (B2B today; B2E, POS and back office will share it by role)
+  web-portal/          Next.js portal for agencies, corporate travellers and back office, by role
 packages/
   contracts/           canonical models (Money, FlightOffer, ...), supplier interface, error codes
   supplier-gateway/    resilience (timeouts, circuit breaker) and supplier adapters (mock for now)
@@ -69,8 +70,14 @@ Seeded users (password `Password123!`):
 | owner@safaridesk.dev | Safari Desk Travel (agency) | admin, agent |
 | agent@safaridesk.dev | Safari Desk Travel (agency) | agent |
 | agent@coastways.dev | Coastways Tours (agency) | agent |
+| manager@acme.dev | Acme Kenya (corporate) | travel manager (admin), traveller |
+| approver@acme.dev | Acme Kenya (corporate) | approver, traveller |
+| staff@acme.dev | Acme Kenya (corporate) | traveller, staff grade (approver: approver@acme.dev) |
+| exec@acme.dev | Acme Kenya (corporate) | traveller, executive grade (no approval needed) |
 
-Safari Desk starts with USD 5,000 plus a USD 1,000 credit line; Coastways with USD 500.
+Safari Desk starts with USD 5,000 plus a USD 1,000 credit line; Coastways with USD 500; Acme Kenya has a USD 20,000 company account.
+
+To see an approval, sign in as staff@acme.dev, search a business-class flight, give a reason and send it. Without `SMTP_URL` the approval email (with its one-click link) is printed in the API log; or sign in as approver@acme.dev and open Approvals.
 
 ### Try the flow with curl
 
@@ -128,14 +135,20 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 | GET | /api/v1/ops/queue | Failed and stuck bookings |
 | POST | /api/v1/ops/bookings/{ref}/resolve | Record what operations did |
 | POST | /api/v1/ops/jobs/run | Run background jobs now (operator admin) |
+| GET | /api/v1/corporate/me | The traveller's grade, policy and approver |
+| GET / PUT | /api/v1/corporate/policies | Travel policies per grade (travel manager) |
+| GET / PUT | /api/v1/corporate/employees[/{userId}] | Grades, cost centres, approvers (travel manager) |
+| GET | /api/v1/corporate/reports/spend?from&to | Spend, compliance and missed savings |
+| GET | /api/v1/approvals | Trips waiting for the signed-in approver |
+| POST | /api/v1/approvals/{id}/decision | Approve or reject in the portal |
+| GET / POST | /api/v1/approvals/{id}/by-token | One-click decision from the email link (no login) |
 | GET | /health | Liveness |
 
 ## Next steps
 
 Following the delivery plan, Phase 1:
 
-1. Corporate travel (B2E): policies, approvals.
-3. Own flight inventory (A2A, charters, blocked seats) and travel insurance.
-4. Holiday packages and visa services.
-5. B2C website, front-office desk (POS) and the AI agent.
-6. First real flight adapter once the supplier is chosen; Keycloak; Kafka in place of the in-process event bus.
+1. Own flight inventory (A2A, charters, blocked seats) and travel insurance.
+2. Holiday packages and visa services.
+3. B2C website, front-office desk (POS) and the AI agent.
+4. First real flight adapter once the supplier is chosen; Keycloak; Kafka in place of the in-process event bus.

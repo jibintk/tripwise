@@ -7,6 +7,13 @@ import { AppError } from '../common/errors';
 import { APP_CONFIG, AppConfig } from '../config';
 import { PriceQuote, PricingContext } from '../pricing/pricing-engine';
 import { PricingService } from '../pricing/pricing.service';
+import { CorporateService } from '../corporate/corporate.service';
+import { Cabin } from '../corporate/policy-engine';
+
+/** The sales channel a caller books through; it selects which markup rules apply. */
+export function channelFor(user: AuthUser): 'b2b' | 'b2e' {
+  return user.tenantType === 'corporate' ? 'b2e' : 'b2b';
+}
 import { SupplierRegistry } from './supplier-registry';
 
 export interface SupplierStatus {
@@ -38,6 +45,7 @@ export class FlightSearchService {
     private readonly registry: SupplierRegistry,
     private readonly cache: CacheService,
     private readonly pricing: PricingService,
+    private readonly corporate: CorporateService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -64,9 +72,40 @@ export class FlightSearchService {
     }
     const pricer = await this.pricing.pricerFor(user.tenantPath);
     const priced = offers
-      .map((o) => this.present(user, o, pricer(o.price.total, this.pricingContext(req, o))))
+      .map((o) => this.present(user, o, pricer(o.price.total, this.pricingContext(req, o, channelFor(user)))))
       .sort((a, b) => a.pricing.sell.amount - b.pricing.sell.amount);
+
+    // Corporate travellers see every fare checked against their policy, and the lowest logical fare.
+    const traveller = await this.corporate.travellerContext(user);
+    if (traveller) {
+      const travellers = req.passengers.ADT + (req.passengers.CHD ?? 0) + (req.passengers.INF ?? 0);
+      const annotated = priced.map((o, i) => ({
+        ...o,
+        lowestFare: i === 0,
+        policy: this.corporate.flightVerdict(traveller, {
+          cabin: (o.cabin ?? req.cabin) as Cabin,
+          sellAmount: o.pricing.sell.amount,
+          currency: o.pricing.sell.currency,
+          travellers,
+          departureDate: req.departureDate,
+          refundable: o.refundable,
+        }),
+      }));
+      return { searchId, fromCache, suppliers: cached.suppliers, offers: annotated, policy: { grade: traveller.grade, approvalMode: traveller.policy.approvalMode } };
+    }
     return { searchId, fromCache, suppliers: cached.suppliers, offers: priced };
+  }
+
+  /** The cheapest sell price in a cached search, for the caller: the "lowest logical fare". */
+  async lowestSell(user: AuthUser, searchId: string): Promise<number | undefined> {
+    const cached = await this.cache.get<CachedSearch>(`search:${searchId}`);
+    if (!cached) return undefined;
+    const offers = (await Promise.all(cached.offerIds.map((id) => this.cache.get<FlightOffer>(`offer:${id}`)))).filter(
+      (o): o is FlightOffer => !!o,
+    );
+    if (!offers.length) return undefined;
+    const pricer = await this.pricing.pricerFor(user.tenantPath);
+    return Math.min(...offers.map((o) => pricer(o.price.total, this.pricingContext(cached.request, o, channelFor(user))).sell.amount));
   }
 
   async getOffer(offerId: string): Promise<FlightOffer> {
@@ -85,7 +124,7 @@ export class FlightSearchService {
     );
     await this.cache.set(`offer:${fresh.offerId}`, fresh, this.config.SEARCH_CACHE_TTL_SECONDS);
     const pricer = await this.pricing.pricerFor(user.tenantPath);
-    return { offer: fresh, quote: pricer(fresh.price.total, this.pricingContext(undefined, fresh)) };
+    return { offer: fresh, quote: pricer(fresh.price.total, this.pricingContext(undefined, fresh, channelFor(user))) };
   }
 
   async fareRules(user: AuthUser, offerId: string, traceId: string) {
@@ -93,16 +132,16 @@ export class FlightSearchService {
     return this.registry.call(offer.supplier, this.ctx(user, traceId), (s) => s.fareRules(offer, this.ctx(user, traceId)));
   }
 
-  pricingContext(req: FlightSearchRequest | undefined, offer: FlightOffer): PricingContext {
+  pricingContext(req: FlightSearchRequest | undefined, offer: FlightOffer, channel: 'b2b' | 'b2e' | 'b2c' | 'pos' = 'b2b'): PricingContext {
     const first = offer.slices[0].segments[0];
     const lastSeg = offer.slices[0].segments[offer.slices[0].segments.length - 1];
     return {
       product: 'flight',
-      channel: 'b2b',
+      channel,
       supplier: offer.supplier,
       origin: first.origin,
       destination: lastSeg.destination,
-      cabin: req?.cabin,
+      cabin: offer.cabin ?? req?.cabin,
     };
   }
 

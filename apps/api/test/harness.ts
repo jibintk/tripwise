@@ -16,7 +16,7 @@ export const TEST_DATABASE_URL =
 /** Drops every Tripwise schema, migrates from scratch and seeds the standard world. */
 export async function resetDatabase(pool: Pool) {
   await pool.query(`
-    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify, hotels CASCADE;
+    DROP SCHEMA IF EXISTS tenancy, pricing, payments, booking, audit, platform, notify, hotels, policy CASCADE;
     DROP TABLE IF EXISTS public.schema_migration;`);
   await migrate(pool);
   await seed(pool);
