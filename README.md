@@ -16,6 +16,7 @@ The first vertical slice: an agency searches flights, books, pays from its walle
 - **Booking saga**: reprice → hold → pay → ticket → confirm, with every step logged as an event. Payment is idempotent and race-safe. A ticketing failure after payment is retried, then refunded automatically.
 - **Ledger**: double-entry, append-only. Wallet balance plus credit limit decides what an agency can spend. Operator finance tops up wallets.
 - **Errors**: every error is `application/problem+json` with a stable `code` and a `traceId`.
+- **B2B partner portal** (Next.js): sign in, search flights, enter travellers, hold, pay and ticket, see bookings and the wallet statement. Price changes, expired fares and insufficient funds are handled on screen.
 
 ## Repository layout
 
@@ -31,6 +32,7 @@ apps/
       bookings/        booking saga
       db/              SQL migrations, migration runner, seed data
     test/              integration tests against a real Postgres
+  web-portal/          Next.js partner portal (B2B today; B2E, POS and back office will share it by role)
 packages/
   contracts/           canonical models (Money, FlightOffer, ...), supplier interface, error codes
   supplier-gateway/    resilience (timeouts, circuit breaker) and supplier adapters (mock for now)
@@ -48,7 +50,10 @@ pnpm --filter "./packages/**" build
 pnpm db:migrate
 pnpm db:seed
 pnpm dev:api                             # http://localhost:4000/api/v1
+pnpm dev:portal                          # http://localhost:3000 (in a second terminal)
 ```
+
+The portal reads the API address from `NEXT_PUBLIC_API_URL` (default `http://localhost:4000/api/v1`).
 
 Seeded users (password `Password123!`):
 
@@ -113,9 +118,9 @@ API integration tests need a Postgres database; they reset it on every run. Defa
 
 Following the delivery plan, Phase 1:
 
-1. B2B portal screens for search, booking and wallet (Next.js).
-2. Recovery job for bookings left in `ticketing` by a crash, and hold-expiry sweeps.
-3. Outbox table and Kafka events (`booking.confirmed`, ...), then e-ticket PDFs and email.
-4. First real flight adapter once the supplier is chosen, behind the same `FlightSupplier` interface.
+1. Recovery job for bookings left in `ticketing` by a crash, and hold-expiry sweeps.
+2. Outbox table and Kafka events (`booking.confirmed`, ...), then e-ticket PDFs and email.
+3. First real flight adapter once the supplier is chosen, behind the same `FlightSupplier` interface.
+4. Back-office screens: agencies, pricing rules, wallet top-ups, failed-booking queue.
 5. Keycloak for login, Postgres row-level security as a second tenant guard.
 6. Hotel module and hotel content mapping.
